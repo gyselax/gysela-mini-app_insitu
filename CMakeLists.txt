@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 
 cmake_minimum_required(VERSION 3.25)
-project(gysela-mini-app_io C CXX)
+project(gysela-mini-app_io CXX)
 
 ###############################################################################################
 #                           List of options for Gyselalib++ library

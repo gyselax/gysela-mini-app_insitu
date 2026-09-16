@@ -7,14 +7,14 @@ target_link_libraries(gys_compress
         PDI::PDI_C
         paraconf::paraconf
         MPI::MPI_CXX
-        gslx::initialisation_xyvxvy_double
-        gslx::vlasov_xyvxvy_double
-        gslx::poisson_xy_double
-        gslx::advection
-        gslx::speciesinfo
-        gslx::time_integration_xyvxvy_double
-        gslx::io
-        gslx::utils
+        gyselalibxx::initialisation_xyvxvy_double
+        gyselalibxx::vlasov_xyvxvy_double
+        gyselalibxx::poisson_xy_double
+        gyselalibxx::advection
+        gyselalibxx::speciesinfo
+        gyselalibxx::time_integration_xyvxvy_double
+        gyselalibxx::io
+        gyselalibxx::utils
 )
 
 get_filename_component(PROJECT_ROOT_DIR ${CMAKE_SOURCE_DIR} ABSOLUTE)
