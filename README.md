@@ -1,4 +1,5 @@
-# Gysela Mini Apps
+# Gysela-mini-app_insitu
+Mini-application for in-situ and in-transit tests
 
 A minimal application demonstrating GYSELA I/O operations and testing the CPU performance scaling for 5D particle distribution functions.
 
