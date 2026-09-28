@@ -25,4 +25,4 @@ endif()
 add_subdirectory(src)
 
 ## Build the simulations (applications mains) in `apps/`
-add_subdirectory(apps/)
+add_subdirectory(simulations/)
