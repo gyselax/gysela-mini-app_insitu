@@ -13,7 +13,7 @@ from datetime import datetime
 import yaml
 import csv
 
-GYS_COMPRESS_BIN = "./build/apps/compression/gys_compress"
+GYS_COMPRESS_BIN = "./build/simulations/compression/gys_compress"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
