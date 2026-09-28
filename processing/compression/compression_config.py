@@ -1,9 +1,9 @@
 """Compressor selection for the offline and online compression pipelines."""
 
 import inspect
-from compression_methods.PCA import PCACompressor
-from compression_methods.random_noise import RandomNoiseCompressor
-from compression_methods.neural_network import NeuralNetworkCompressor, OnlineNeuralNetworkCompressor
+from processing.compression.compression_methods.PCA import PCACompressor
+from processing.compression.compression_methods.random_noise import RandomNoiseCompressor
+from processing.compression.compression_methods.neural_network import NeuralNetworkCompressor, OnlineNeuralNetworkCompressor
 
 
 

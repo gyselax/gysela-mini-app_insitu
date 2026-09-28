@@ -6,27 +6,33 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from datetime import datetime
 
 import yaml
 import csv
 
-# ------------------------------------------------------------------
-# Compression params / names
-# ------------------------------------------------------------------
-from evaluate_compression import plot_diags, plot_final_snapshot_comparison
-
-
 GYS_COMPRESS_BIN = "./build/apps/compression/gys_compress"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
 
-SOURCE_GYSELA_YAML = os.path.join(SCRIPT_DIR, "params_two_stream.yaml")
-SOURCE_PDI_YAML = os.path.join(SCRIPT_DIR, "pdi_out_diags.yaml")
-ANALYTICS_SCRIPT = os.path.join(BASE_DIR, "src", "python", "diagnostics.py")
-COMPRESSION_DIAGNOSTICS_SCRIPT = os.path.join(os.path.dirname(ANALYTICS_SCRIPT), "compression_diagnostics.py")
+# Make the `processing` python package (repo root) importable no matter
+# where this script is invoked from.
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+# ------------------------------------------------------------------
+# Compression params / names
+# ------------------------------------------------------------------
+from processing.compression.evaluate_compression import plot_diags, plot_final_snapshot_comparison
+
+
+SOURCE_GYSELA_YAML = os.path.join(SCRIPT_DIR, "params", "params_two_stream.yaml")
+SOURCE_PDI_YAML = os.path.join(SCRIPT_DIR, "params", "pdi_out_diags.yaml")
+ANALYTICS_SCRIPT = os.path.join(BASE_DIR, "processing", "diagnostics.py")
+COMPRESSION_DIAGNOSTICS_SCRIPT = os.path.join(BASE_DIR, "processing", "compression", "compression_diagnostics.py")
 
 # ------------------------------------------------------------------
 # Toolchain resolution: a single --arch flag picks

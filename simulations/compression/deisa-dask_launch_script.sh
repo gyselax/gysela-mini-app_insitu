@@ -7,25 +7,49 @@
 # Defaults:
 #   SIMU_NODES     = 1
 #   DASK_WORKERS   = 1
-#   GYSELA_PARAMS  = params_landau_damping.yaml
-#   PDI_CONFIG     = pdi_out_diags.yaml
-#   ANALYTICS_FILE = <repo_root>/src/python/diagnostics.py
+#   GYSELA_PARAMS  = params/params_landau_damping.yaml
+#   PDI_CONFIG     = params/pdi_out_diags.yaml
+#   ANALYTICS_FILE = <repo_root>/processing/diagnostics.py
 
 SIMU_NODES=${1:-1}
 DASK_WORKERS=${2:-1}
-GYSELA_PARAMS=${3:-params_landau_damping.yaml}
-PDI_CONFIG=${4:-pdi_out_diags.yaml}
+GYSELA_PARAMS=${3:-params/params_landau_damping.yaml}
+PDI_CONFIG=${4:-params/pdi_out_diags.yaml}
 ANALYTICS_ARG=${5:-}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd $SCRIPT_DIR/../.. && pwd)"
 
-. ${BASE_DIR}/apps/io/activate_deisa_spack_env.sh
-# activate_deisa_spack_env.sh overwrites SCRIPT_DIR and BASE_DIR — restore them
+# Resolve the toolchain environment the same way launch_benchmark.py does
+# (replaces the deleted apps/io/activate_deisa_spack_env.sh).
+if [ -n "$(command -v scontrol)" ] && scontrol show config 2>/dev/null | grep -qi adastra; then
+    SITE="adastra"
+    ARCH="genoa"
+else
+    SITE="persee"
+    ARCH="xeon"
+fi
+
+TOOLCHAIN_ENV="${BASE_DIR}/toolchains/${SITE}/${ARCH}/environment.sh"
+if [ -f "${TOOLCHAIN_ENV}" ]; then
+    . "${TOOLCHAIN_ENV}"
+fi
+
+# Sourcing the toolchain environment may have reset our markers — restore them.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd $SCRIPT_DIR/../.. && pwd)"
 
-ANALYTICS_FILE="${ANALYTICS_ARG:-$BASE_DIR/src/python/diagnostics.py}"
+# The spack view that holds the PDI + deisa Python runtime.
+export PYTHONPATH=/data/gyselarunner/gysela-io-env-deisa/.spack-env/view/lib/python3.13/site-packages:${PYTHONPATH:-}
+
+# Make the `processing` python package (repo root) importable.
+export PYTHONPATH="${BASE_DIR}:${PYTHONPATH}"
+
+if [ -f "${BASE_DIR}/.gys_env/bin/activate" ]; then
+    . "${BASE_DIR}/.gys_env/bin/activate"
+fi
+
+ANALYTICS_FILE="${ANALYTICS_ARG:-$BASE_DIR/processing/diagnostics.py}"
 
 SCHEFILE="$BASE_DIR/scheduler.json"
 rm -f $SCHEFILE

@@ -82,7 +82,7 @@ plugins:
           import numpy as np
           from mpi4py import MPI
           from deisa.dask import Bridge
-          import compression_diagnostics
+          from processing.compression import compression_diagnostics
           import pdi
           comm = MPI.COMM_WORLD
           rank = comm.Get_rank()

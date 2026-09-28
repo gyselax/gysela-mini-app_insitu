@@ -14,7 +14,7 @@ from tqdm import tqdm
 from scimba_jax.nonlinear_approximation.networks.mlp import MLP
 from scimba_jax.nonlinear_approximation.optimizers.optimizers import (ScimbaAdam, ScimbaLBfgs)
 
-from Compressor import Compressor
+from processing.compression.compressor import Compressor
 
 jax.config.update("jax_enable_x64", True)
 

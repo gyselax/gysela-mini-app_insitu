@@ -9,7 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
-from compression_methods.neural_network import (
+from processing.compression.compression_methods.neural_network import (
     AVAILABLE_INR_ARCHS,
     OnlineNeuralNetworkCompressor,
     assemble_global_field,

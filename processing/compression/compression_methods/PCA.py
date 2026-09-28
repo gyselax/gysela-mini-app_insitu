@@ -7,7 +7,7 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-from Compressor import Compressor
+from processing.compression.compressor import Compressor
 
 
 class PCACompressor(Compressor):

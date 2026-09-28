@@ -8,7 +8,7 @@ import h5py
 from dataclasses import dataclass
 from pathlib import Path
 
-from compression_config import build_online_compressor, build_offline_compressor
+from processing.compression.compression_config import build_online_compressor, build_offline_compressor
 
 
 @dataclass

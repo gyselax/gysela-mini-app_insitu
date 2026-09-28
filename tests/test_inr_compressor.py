@@ -2,9 +2,9 @@ import os
 import sys
 import numpy as np
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../python')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from compression_methods.neural_network import NeuralNetworkCompressor
+from processing.compression.compression_methods.neural_network import NeuralNetworkCompressor
 
 def generate_synthetic_fdistribu(n_species, nx, ny, nvx, nvy):
     """Generates a synthetic 5D distribution function: a maxwellian distribution with a slight periodic spatial perturbation."""

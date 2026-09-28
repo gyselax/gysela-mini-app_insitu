@@ -24,7 +24,7 @@ sh ./installer.sh <MACHINE>
 Example on Persee (CPU): `./installer.sh persee/xeon`
 
 
-`<MACHINE>` is a folder under `src/external/gyselalibxx/toolchains/`. 
+`<MACHINE>` is a folder under `toolchains/`.
 Available values:
 
 - `a100.leonardo.spack` — Leonardo (A100)
@@ -40,7 +40,7 @@ Available values:
 ## Manual installation
 
 ```bash
-source src/external/gyselalibxx/toolchains/<MACHINE>/environment.sh
+source toolchains/<MACHINE>/environment.sh
 python -m venv .gys_env    # skip if .gys_env already exists
 source .gys_env/bin/activate
 pip install -e ".[dev]"
@@ -50,15 +50,10 @@ For more details see [Gyselalib++ environment toolchains](https://gyselax.github
 
 ## Building
 
-By default, both apps are built:
-
-- IO app
-- Compression app
-
-You can disable either app at configuration time using CMake options:
+By default, the compression app is built:
 
 ```bash
-cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=src/external/gyselalibxx/toolchains/<MACHINE>/toolchain.cmake 
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=toolchains/<MACHINE>/toolchain.cmake
 cmake --build build -j 4
 ```
 

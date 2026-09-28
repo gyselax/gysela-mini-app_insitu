@@ -10,7 +10,7 @@ import numpy as np
 from deisa.dask import Deisa
 from distributed import get_client
 
-import compression_diagnostics
+from processing.compression import compression_diagnostics
 
 _MEASURE_CFG = None
 
