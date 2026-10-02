@@ -15,13 +15,6 @@ import csv
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-# ------------------------------------------------------------------
-# Compression params / names
-# ------------------------------------------------------------------
-from evaluate_compression import plot_diags, plot_final_snapshot_comparison
-from compression_methods.neural_network import AVAILABLE_INR_ARCHS, AVAILABLE_POLISH_OPTIMIZERS
-
-
 GYS_COMPRESS_BIN = "./build/simulations/compression/gys_compress"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -35,6 +28,10 @@ if BASE_DIR not in sys.path:
 # ------------------------------------------------------------------
 # Compression params / names
 # ------------------------------------------------------------------
+from processing.compression.compression_methods.neural_network import (
+    AVAILABLE_INR_ARCHS,
+    AVAILABLE_POLISH_OPTIMIZERS,
+)
 from processing.compression.evaluate_compression import plot_diags, plot_final_snapshot_comparison
 
 
@@ -197,7 +194,9 @@ def parse_args():
         ),
     )
 
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+
+    mode_group.add_argument(
         "--online",
         action="store_true",
         help=(
@@ -205,6 +204,14 @@ def parse_args():
         ),
     )
 
+    mode_group.add_argument(
+        "--offline",
+        action="store_const",
+        const=False,
+        default=False,
+        dest="online",
+        help="Use offline compression (the default).",
+    )
 
     parser.add_argument(
         "--compression", 
