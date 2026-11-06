@@ -21,6 +21,7 @@ dependencies = [
     "tqdm",
     "iops-benchmark",
     "iops-benchmark[bayesian]",
+    "distributed==2025.5.0",
     "rich",
     "flax>=0.12.7",
     "optax>=0.2.8",
