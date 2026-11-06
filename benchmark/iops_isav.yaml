@@ -332,7 +332,7 @@ machines:
           sleep 10
 
           echo "Launch analytics"
-          python3 $BASE_DIR/src/python/diagnostics.py &
+          python3 $BASE_DIR/processing/diagnostics.py &
           analytics_pid=$!
           sleep 60
 
@@ -361,9 +361,9 @@ machines:
                 ranks/node, $SIMU_RANKS ranks total)"
           srun -l -N $SIMU_NODES -n $SIMU_RANKS --cpus-per-task={{ threads_per_rank }} \
             --threads-per-core=2 --cpu-bind=ldoms -r ${REL} \
-            $BASE_DIR/build/apps/compression/gys_compress \
+            $BASE_DIR/build/simulations/compression/gys_compress \
             {{ execution_dir }}/gys_compress.yaml \
-            $BASE_DIR/apps/compression/{{ pdi_yaml }} &
+            $BASE_DIR/simulations/compression/params/{{ pdi_yaml }} &
           simu_pid=$!
 
           {% if diag_mode == 1 %}
@@ -374,7 +374,7 @@ machines:
           echo "Simulation over"
 
           {% if diag_mode == 2 %}
-          python3 $BASE_DIR/src/python/finalize_reduced_diagnostics.py \
+          python3 $BASE_DIR/processing/finalize_reduced_diagnostics.py \
             {{ execution_dir }}
           {% endif %}
 
@@ -461,7 +461,7 @@ machines:
           sleep 10
 
           echo "Launch analytics"
-          python3 $BASE_DIR/src/python/diagnostics.py &
+          python3 $BASE_DIR/processing/diagnostics.py &
           analytics_pid=$!
           sleep 60
 
@@ -494,9 +494,9 @@ machines:
           srun -N $SIMU_NODES -n $SIMU_RANKS --ntasks-per-node={{ ranks_per_node }}\
             --cpu-bind=none --mem-bind=none --mem=0 -r ${REL} \
             {{ inputs.mi250_gpu_binding.path }} \
-            $BASE_DIR/build/apps/compression/gys_compress \
+            $BASE_DIR/build/simulations/compression/gys_compress \
             {{ execution_dir }}/gys_compress.yaml \
-            $BASE_DIR/apps/compression/{{ pdi_yaml }} &
+            $BASE_DIR/simulations/compression/params/{{ pdi_yaml }} &
           simu_pid=$!
  
           {% if diag_mode == 1 and deisa_version == 'dask' %}
@@ -507,6 +507,6 @@ machines:
           echo "Simulation over"
 
           {% if diag_mode == 2 %}
-          python3 $BASE_DIR/src/python/finalize_reduced_diagnostics.py \
+          python3 $BASE_DIR/processing/finalize_reduced_diagnostics.py \
             {{ execution_dir }}
           {% endif %}
