@@ -20,13 +20,15 @@
 # ---------------------------------------------------------------------------
 #   * 8 CPUs (0,8,16,24,32,40,48,56) + the 8 GCDs -> gysela-mini-app
 #        1 MPI rank per GCD, each rank pinned to one CPU + one GCD
-#   * the remaining 56 CPUs -> Ray + analytics, split as
-#         RAY_CPUS + ANALYTICS_CPUS = 56
-#     with RAY_CPUS=48 and ANALYTICS_CPUS=8 by default. The two sets are
-#     disjoint: Ray (head + workers) is pinned to its 48 CPUs, analytics to the
-#     8 CPUs reserved for it. Ray is told its budget through
-#     `ray start --num-cpus=${RAY_CPUS}`, so Ray tasks never use more than
-#     RAY_CPUS. Change the split with, e.g., `RAY_CPUS=40 sbatch launch-...sh`.
+#   * the remaining 56 CPUs -> Ray + analytics. On the head node they are split
+#     as RAY_CPUS + ANALYTICS_CPUS = 56, with RAY_CPUS=48 and ANALYTICS_CPUS=8
+#     by default: the Ray head is pinned to its 48 CPUs, analytics to the 8
+#     CPUs reserved for it. Worker nodes run no analytics, so their Ray workers
+#     take all 56 free CPUs (RAY_WORKER_CPUS), leaving no CPU idle. Ray is told
+#     its budget through `ray start --num-cpus=...`, so Ray tasks never use more
+#     than the CPUs advertised on the node they run on. Change the split with,
+#     e.g., `RAY_CPUS=40 sbatch launch-...sh`, or `RAY_WORKER_CPUS=48` to leave
+#     the last 8 CPUs idle on workers as well.
 #
 # The GPU <-> CPU affinity mirrors the `mi250_gpu_binding.sh` input of the
 # original benchmark; it is written out below so the job is self-contained.
@@ -105,7 +107,9 @@ exec >>"${LOG_DIR}/job.log" 2>&1
 RANKS_PER_NODE=8                        # one MPI rank (and one GCD) per rank
 SIM_ANCHOR_CPUS=(0 8 16 24 32 40 48 56) # 1 gysela CPU per GCD
 RAY_ANALYTICS_CPUS=56                   # CPUs left to Ray + analytics on each node
-RAY_CPUS=${RAY_CPUS:-48}                # CPUs Ray is told it owns
+RAY_CPUS=${RAY_CPUS:-48}                # CPUs the Ray head owns (analytics takes the rest)
+RAY_WORKER_CPUS=${RAY_WORKER_CPUS:-${RAY_ANALYTICS_CPUS}} # worker nodes run no analytics,
+                                        # so their Ray workers take every free CPU
 ANALYTICS_CPUS=$((RAY_ANALYTICS_CPUS - RAY_CPUS))
 RAY_PORT=6379
 
@@ -113,10 +117,16 @@ if ((RAY_CPUS < 0 || RAY_CPUS > RAY_ANALYTICS_CPUS)); then
   echo "ERROR: RAY_CPUS must be in [0, ${RAY_ANALYTICS_CPUS}] (got ${RAY_CPUS})" >&2
   exit 1
 fi
+if ((RAY_WORKER_CPUS < 0 || RAY_WORKER_CPUS > RAY_ANALYTICS_CPUS)); then
+  echo "ERROR: RAY_WORKER_CPUS must be in [0, ${RAY_ANALYTICS_CPUS}] (got ${RAY_WORKER_CPUS})" >&2
+  exit 1
+fi
 
 # The 56 CPUs not used by the gysela ranks, i.e. every CPU id that is not one
-# of the anchors (multiples of 8). Split into two disjoint sets: Ray takes the
-# first RAY_CPUS, analytics the remaining ANALYTICS_CPUS.
+# of the anchors (multiples of 8). On the head node they are split into two
+# disjoint sets: Ray takes the first RAY_CPUS, analytics the remaining
+# ANALYTICS_CPUS. Worker nodes run no analytics, so their Ray workers take the
+# first RAY_WORKER_CPUS (all 56 by default), leaving no CPU idle.
 ALL_CPUS=()
 for ((c = 0; c < 64; c++)); do
   ((c % 8 == 0)) || ALL_CPUS+=("$c")
@@ -145,6 +155,7 @@ compress_ranges() {
 
 RAY_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:0:RAY_CPUS}")
 ANALYTICS_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:RAY_CPUS}")
+RAY_WORKER_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:0:RAY_WORKER_CPUS}")
 
 # -----------------------------------------------------------------------------
 # Environment
@@ -205,7 +216,8 @@ echo "Allocated nodes : ${NODES[*]}"
 echo "Ray head node   : ${HEAD_NODE}"
 echo "Ray worker nodes: ${WORKER_NODELIST:-<none>}"
 echo "CPUs  gysela       : ${SIM_ANCHOR_CPUS[*]} (1 per GCD)"
-echo "CPUs  Ray (${RAY_CPUS})     : ${RAY_CPU_SET}"
+echo "CPUs  Ray head (${RAY_CPUS})     : ${RAY_CPU_SET}"
+echo "CPUs  Ray worker (${RAY_WORKER_CPUS})   : ${RAY_WORKER_CPU_SET}"
 echo "CPUs  analytics (${ANALYTICS_CPUS}): ${ANALYTICS_CPU_SET}"
 
 # -----------------------------------------------------------------------------
@@ -297,11 +309,11 @@ if ((NNODES > 1)); then
             export HIP_VISIBLE_DEVICES=''
             node_ip=\$(ip -o -4 addr show hsn0 | awk '{print \$4}' | cut -d/ -f1)
             echo '[Ray WORKER] hostname: '\$(hostname)' ip:' \$node_ip
-            numactl --physcpubind='${RAY_CPU_SET}' \
+            numactl --physcpubind='${RAY_WORKER_CPU_SET}' \
                 ray start \
                     --address='${HEAD_IP}:${RAY_PORT}' \
                     --node-ip-address=\$node_ip \
-                    --num-cpus=${RAY_CPUS} \
+                    --num-cpus=${RAY_WORKER_CPUS} \
                     --disable-usage-stats \
                     --block
         " >"${LOG_DIR}/ray-worker.log" 2>&1 &
