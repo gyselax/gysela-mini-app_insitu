@@ -30,7 +30,7 @@
 #include "neumann_spline_quadrature.hpp"
 #include "output.hpp"
 #include "paraconfpp.hpp"
-#include "predcorr_compress.hpp"
+#include "predcorr_deisa_bench.hpp"
 #include "qnsolver.hpp"
 #include "singlemodeperturbinitialisation.hpp"
 #include "species_info.hpp"
@@ -217,7 +217,7 @@ void print_banner(int rank) {
     return;
   }
   cout << "==========================================" << endl;
-  cout << "      GYSELA COMPRESSION MINI APP         " << endl;
+  cout << "      GYSELA DEISA BENCH MINI APP         " << endl;
   cout << "==========================================" << endl;
 }
 
@@ -299,17 +299,6 @@ int main(int argc, char **argv) {
     iter_offset =
         static_cast<int>(PCpp_int(configs.conf_gyselax, ".Input.iter_offset"));
   }
-  int compression_period = 0;
-  if (!PC_status(PC_get(configs.conf_gyselax, ".CompressionBenchmark.compression_period"))) {
-    compression_period = static_cast<int>(
-        PCpp_int(configs.conf_gyselax, ".CompressionBenchmark.compression_period"));
-  }
-  int compression_mode = 2;  // 0 = none, 1 = online (pycall), 2 = offline (deisa-dask)
-  if (!PC_status(PC_get(configs.conf_gyselax, ".CompressionBenchmark.compression_mode"))) {
-    compression_mode = static_cast<int>(
-        PCpp_int(configs.conf_gyselax, ".CompressionBenchmark.compression_mode"));
-  }
-
   if (rank == 0) {
     std::cout << "Input fdistribu file name: " << fdistribu_filename
               << std::endl;
@@ -394,7 +383,7 @@ int main(int argc, char **argv) {
   QNSolver const poisson(fft_poisson_solver, rhs);
 
   // Create predcorr operator
-  PredCorrCompress const predcorr(vlasov, poisson);
+  PredCorrDeisaBench const predcorr(vlasov, poisson);
 
   // Starting the code
   ddc::expose_to_pdi("Nx_spline_cells",
@@ -410,8 +399,6 @@ int main(int argc, char **argv) {
   expose_mesh_to_pdi("MeshVx", idxrange_vx);
   expose_mesh_to_pdi("MeshVy", idxrange_vy);
   ddc::expose_to_pdi("nbstep_diag", nbstep_diag);
-  ddc::expose_to_pdi("nb_step_compression", compression_period);
-  ddc::expose_to_pdi("compression_mode", compression_mode);
   ddc::expose_to_pdi("deltat", deltat);
   ddc::expose_to_pdi("Nkinspecies", idx_range_kinsp.size());
   ddc::expose_to_pdi("fdistribu_charges",

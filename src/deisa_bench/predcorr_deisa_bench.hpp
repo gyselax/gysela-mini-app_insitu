@@ -9,21 +9,14 @@ class IQNSolver;
 class IVlasovSolver;
 
 /**
- * @brief Predictor-corrector time solver for the compression benchmark app.
+ * @brief Predictor-corrector time solver for the in-situ benchmark app.
  *
- * Identical to gyselalibxx's `PredCorr` (geometryXYVxVy/time_integration),
- * except that it copies the host-side `fdistribu` buffer back into the
- * device-resident field after the "iteration"/"last_iteration" PDI events.
- *
- * `PredCorr` only ever copies the device field to the host to expose it to
- * PDI for diagnostics/output; the in-situ compression handlers wired up in
- * pdi_out_diags.yaml mutate that host buffer in place (`fdistribu[...] =
- * approx`), but with no code to write it back, that mutation was silently
- * discarded and the predictor/corrector kept advancing the original,
- * uncompressed device field. This class adds the missing copy-back so
- * in-situ compression actually affects the simulation trajectory.
+ * At every iteration, fdistribu is copied to the host in the (species, x, y, vx, vy)
+ * layout and exposed to PDI with the "iteration" event, and once more after the last
+ * iteration with the "last_iteration" event, for the in-situ analytics wired up in
+ * pdi_out_diags.yaml. The host copy is read-only for the PDI handlers.
  */
-class PredCorrCompress : public ITimeSolver
+class PredCorrDeisaBench : public ITimeSolver
 {
 private:
     IVlasovSolver const& m_vlasov_solver;
@@ -36,9 +29,9 @@ public:
      * @param[in] vlasov_solver A solver for a Boltzmann equation.
      * @param[in] poisson_solver A solver for a Poisson equation.
      */
-    PredCorrCompress(IVlasovSolver const& vlasov_solver, IQNSolver const& poisson_solver);
+    PredCorrDeisaBench(IVlasovSolver const& vlasov_solver, IQNSolver const& poisson_solver);
 
-    ~PredCorrCompress() override = default;
+    ~PredCorrDeisaBench() override = default;
 
     /**
      * @brief Solves the Vlasov-Poisson system.

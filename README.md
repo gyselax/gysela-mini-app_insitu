@@ -49,7 +49,7 @@ For more details see [Gyselalib++ environment toolchains](https://gyselax.github
 
 ## Building
 
-By default, the compression app is built:
+By default, the deisa_bench app is built:
 
 ```bash
 cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=toolchains/<MACHINE>/toolchain.cmake
@@ -69,15 +69,11 @@ In order to use the python tools, you'll need to execute the following commands 
 source .gys_env/bin/activate
 ```
 
-If you want to use Python insitu-diagnostics, the following commands are available from the command line:
-```bash
-read-timing-stats
-verify-fluid-moments
-```
+The in-situ analytics in `processing/` are run next to the simulation through deisa; see the app README.
 
 ## Running
 
 Each app has its own usage instructions. See the README file in the corresponding `simulations/` folder for details.
 
-The compression mini-app (`simulations/compression/`) takes a GYSELA YAML config and `params/pdi_out.yaml` on the command line. Case-specific templates are `params/params_landau_damping.yaml` and `params/params_two_stream.yaml`; the compression benchmark launcher uses `params/params_landau_damping.yaml` by default.
+The mini-app (`simulations/deisa_bench/`, executable `gys_deisa_bench`) takes a GYSELA YAML config and a PDI config on the command line: `params/pdi_out.yaml` without analytics, `params/pdi_out_diags.yaml` with the deisa in-situ analytics. Case-specific templates are `params/params_landau_damping.yaml` and `params/params_two_stream.yaml`.
 

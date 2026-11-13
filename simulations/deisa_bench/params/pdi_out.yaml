@@ -9,11 +9,7 @@ metadata:
   iter_offset : int
   time_saved : double
   deltat: double
-  absolute_time: double
   nbstep_diag: int
-  nb_step_compression: int
-  compression_mode: int
-  iter_saved : int
   MeshX_extents: { type: array, subtype: int64, size: 1 }
   MeshX:
     type: array
@@ -89,19 +85,6 @@ plugins:
         exec: |
           if rank == 0:
             print(f"------ iteration {it} - {time.time() - t0} ------", flush=True)
-  set_value:
-    on_init:
-      - share:
-        - iter_saved: 0
-        - absolute_time: 0.0
-    on_data:
-      iter:
-        - set:
-          # Shift file number in order not to change predcorr_implementation
-          - iter_saved: '${iter} + ${iter_offset}'
-          - absolute_time: '(${iter} + ${iter_offset}) * ${deltat}'
-    on_finalize:
-      - release: [iter_saved, absolute_time]
   decl_hdf5:
     - file: '${fdistribu_filename}'
       communicator: $MPI_COMM_WORLD

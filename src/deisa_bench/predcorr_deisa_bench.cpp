@@ -9,16 +9,16 @@
 #include "ddc_alias_inline_functions.hpp"
 #include "iqnsolver.hpp"
 #include "ivlasovsolver.hpp"
-#include "predcorr_compress.hpp"
+#include "predcorr_deisa_bench.hpp"
 #include "transpose.hpp"
 
-PredCorrCompress::PredCorrCompress(IVlasovSolver const& vlasov_solver, IQNSolver const& poisson_solver)
+PredCorrDeisaBench::PredCorrDeisaBench(IVlasovSolver const& vlasov_solver, IQNSolver const& poisson_solver)
     : m_vlasov_solver(vlasov_solver)
     , m_poisson_solver(poisson_solver)
 {
 }
 
-DFieldSpVxVyXY PredCorrCompress::operator()(
+DFieldSpVxVyXY PredCorrDeisaBench::operator()(
         DFieldSpVxVyXY const allfdistribu_v2D_split,
         Real const dt,
         int const steps) const
@@ -66,17 +66,6 @@ DFieldSpVxVyXY PredCorrCompress::operator()(
                 .with("fdistribu", allfdistribu_host)
                 .with("electrostatic_potential", electrostatic_potential_host);
         Kokkos::Profiling::popRegion();
-        // "iteration" handlers (e.g. in-situ compression) may have mutated
-        // allfdistribu_host in place; copy it back into the device-resident
-        // field so the predictor/corrector below advance from the (possibly
-        // compressed) state instead of silently discarding the mutation.
-        ddc::parallel_deepcopy(
-                get_field(allfdistribu_v2D_split_output_layout),
-                allfdistribu_host);
-        transpose_layout(
-                Kokkos::DefaultExecutionSpace(),
-                get_field(allfdistribu_v2D_split),
-                get_const_field(allfdistribu_v2D_split_output_layout));
         // copy fdistribu
         ddc::parallel_deepcopy(allfdistribu_half_t, allfdistribu_v2D_split);
 
@@ -116,15 +105,6 @@ DFieldSpVxVyXY PredCorrCompress::operator()(
             .with("fdistribu", allfdistribu_host)
             .with("electrostatic_potential", electrostatic_potential_host);
     Kokkos::Profiling::popRegion();
-    // Same copy-back as in the loop above, so the returned field reflects any
-    // mutation "last_iteration" handlers made to allfdistribu_host.
-    ddc::parallel_deepcopy(
-            get_field(allfdistribu_v2D_split_output_layout),
-            allfdistribu_host);
-    transpose_layout(
-            Kokkos::DefaultExecutionSpace(),
-            get_field(allfdistribu_v2D_split),
-            get_const_field(allfdistribu_v2D_split_output_layout));
 
     return allfdistribu_v2D_split;
 }

@@ -1,0 +1,234 @@
+metadata:
+  fdistribu_filename_size:  size_t
+  fdistribu_filename: { type: array, subtype: char, size: "$fdistribu_filename_size" }
+  Nx_spline_cells : int
+  Ny_spline_cells : int
+  Nvx_spline_cells : int
+  Nvy_spline_cells : int
+  iter : int
+  iter_offset : int
+  time_saved : double
+  deltat: double
+  absolute_time: double
+  nbstep_diag: int
+  MeshX_extents: { type: array, subtype: int64, size: 1 }
+  MeshX:
+    type: array
+    subtype: double
+    size: [ '$MeshX_extents[0]' ]
+  MeshY_extents: { type: array, subtype: int64, size: 1 }
+  MeshY:
+    type: array
+    subtype: double
+    size: [ '$MeshY_extents[0]' ]
+  MeshVx_extents: { type: array, subtype: int64, size: 1 }
+  MeshVx:
+    type: array
+    subtype: double
+    size: [ '$MeshVx_extents[0]' ]
+  MeshVy_extents: { type: array, subtype: int64, size: 1 }
+  MeshVy:
+    type: array
+    subtype: double
+    size: [ '$MeshVy_extents[0]' ]
+  Nkinspecies: int
+  fdistribu_charges_extents : { type: array, subtype: int64, size: 1 }
+  fdistribu_charges:
+    type: array
+    subtype: double
+    size: [ '$fdistribu_charges_extents[0]' ]
+  fdistribu_masses_extents : { type: array, subtype: int64, size: 1 }
+  fdistribu_masses:
+    type: array
+    subtype: double
+    size: [ '$fdistribu_masses_extents[0]' ]
+  fdistribu_eq_extents : { type: array, subtype: int64, size: 3 }
+  fdistribu_eq:
+    type: array
+    subtype: double
+    size: [ '$fdistribu_eq_extents[0]', '$fdistribu_eq_extents[1]', '$fdistribu_eq_extents[2]' ]
+
+  #-- Parallel data (local chunk)
+  local_fdistribu_starts: { type: array, subtype: size_t, size: 5 }
+  local_fdistribu_extents: { type: array, subtype: size_t, size: 5 }
+
+  #-- Global fdistribu shape (for bridge metadata — distinct from 'fdistribu' data element)
+  global_fdistribu_starts: { type: array, subtype: size_t, size: 5 }
+  global_fdistribu_extents: { type: array, subtype: size_t, size: 5 }
+
+
+data:
+  fdistribu:
+    type: array
+    subtype: double
+    size: [ '$local_fdistribu_extents[0]', '$local_fdistribu_extents[1]', '$local_fdistribu_extents[2]', '$local_fdistribu_extents[3]', '$local_fdistribu_extents[4]' ]
+  electrostatic_potential_extents: { type: array, subtype: int64, size: 2 }
+  electrostatic_potential:
+    type: array
+    subtype: double
+    size: [ '$electrostatic_potential_extents[0]', '$electrostatic_potential_extents[1]' ]
+
+plugins:
+  mpi:
+  pycall:
+    on_event:
+      Init:
+        with: {}
+        exec: |
+          import time
+          import numpy as np
+          from mpi4py import MPI
+          from deisa.dask import Bridge
+          import pdi
+          comm = MPI.COMM_WORLD
+          rank = comm.Get_rank()
+
+          if rank == 0:
+            pycall_time = 0.0
+      InitBridge:
+        with: { global_fdistribu_extents: $global_fdistribu_extents,
+                local_fdistribu_extents: $local_fdistribu_extents,
+                local_fdistribu_starts: $local_fdistribu_starts,
+                MeshX_extents: $MeshX_extents,
+                MeshY_extents: $MeshY_extents,
+                MeshVx_extents: $MeshVx_extents,
+                MeshVy_extents: $MeshVy_extents
+              }
+        exec: |
+          if rank == 0:
+            t0 = time.time()
+
+          Nx  = int(MeshX_extents[0])
+          Ny  = int(MeshY_extents[0])
+          Nvx = int(MeshVx_extents[0])
+          Nvy = int(MeshVy_extents[0])
+          global_shape = tuple(int(x) for x in global_fdistribu_extents)
+          local_shape  = tuple(int(x) for x in local_fdistribu_extents)
+          chunk_pos    = tuple((local_fdistribu_starts // local_fdistribu_extents).astype(int).tolist())
+
+          arrays_metadata = {
+              'fdistribu': {
+                  'global_shape':   global_shape,
+                  'chunk_shape':    local_shape,
+                  'chunk_position': chunk_pos,
+              },
+          }
+
+          if rank == 0:
+            non_dist_arrays = {
+                'absolute_time': {
+                    'global_shape':   (1,),
+                    'chunk_shape':    (1,),
+                    'chunk_position': (0,),
+                },
+                'deltat': {
+                    'global_shape':   (1,),
+                    'chunk_shape':    (1,),
+                    'chunk_position': (0,),
+                },
+                'MeshX':  {'global_shape': (Nx,),  'chunk_shape': (Nx,),  'chunk_position': (0,)},
+                'MeshY':  {'global_shape': (Ny,),  'chunk_shape': (Ny,),  'chunk_position': (0,)},
+                'MeshVx': {'global_shape': (Nvx,), 'chunk_shape': (Nvx,), 'chunk_position': (0,)},
+                'MeshVy': {'global_shape': (Nvy,), 'chunk_shape': (Nvy,), 'chunk_position': (0,)},
+            }
+            arrays_metadata = dict(arrays_metadata, **non_dist_arrays)
+
+          bridge = Bridge(comm, arrays_metadata)
+
+          def share_with_analytics(fdistribu, timestep, t, deltat, meshes):
+            bridge.send("fdistribu", fdistribu, timestep)
+            if rank == 0:
+              bridge.send("absolute_time", np.array([float(t)]), timestep)
+              bridge.send("deltat", np.array([float(deltat)]), timestep)
+              for name, mesh in meshes.items():
+                bridge.send(name, np.array(mesh), timestep)
+
+          if rank == 0:
+            pycall_time += time.time() - t0
+            tbegin = time.time()
+      iteration:
+        with:
+          fdistribu: $fdistribu
+          it: $iter
+          t: $absolute_time
+          deltat: $deltat
+          iter_offset: $iter_offset
+          nbstep_diag: $nbstep_diag
+          MeshX: $MeshX
+          MeshY: $MeshY
+          MeshVx: $MeshVx
+          MeshVy: $MeshVy
+        exec: |
+          if rank == 0:
+            t0 = time.time()
+            print(f"------ iteration {it} - {time.time() - tbegin} ------", flush=True)
+
+          timestep = int(it) + int(iter_offset)
+
+          if timestep % int(nbstep_diag) == 0:
+            share_with_analytics(fdistribu, timestep, t, deltat,
+                                 {"MeshX": MeshX, "MeshY": MeshY, "MeshVx": MeshVx, "MeshVy": MeshVy})
+
+          if rank == 0:
+            if timestep % 10 == 0:
+              print(f"--------------------------timestep: {timestep} -----", flush=True)
+            pycall_time += time.time() - t0
+      last_iteration:
+        with:
+          fdistribu: $fdistribu
+          it: $iter
+          t: $absolute_time
+          deltat: $deltat
+          iter_offset: $iter_offset
+          MeshX: $MeshX
+          MeshY: $MeshY
+          MeshVx: $MeshVx
+          MeshVy: $MeshVy
+        exec: |
+          if rank == 0:
+            t0 = time.time()
+
+          timestep = int(it) + int(iter_offset)
+          share_with_analytics(fdistribu, timestep, t, deltat,
+                               {"MeshX": MeshX, "MeshY": MeshY, "MeshVx": MeshVx, "MeshVy": MeshVy})
+
+          if rank == 0:
+            pycall_time += time.time() - t0
+      EndSimulation:
+        with:
+          it: $iter
+          iter_offset: $iter_offset
+        exec: |
+          if rank == 0:
+            t0 = time.time()
+
+          bridge.close(int(it) + int(iter_offset))
+
+          if rank == 0:
+            pycall_time += time.time() - t0
+            print("Time pycall:", pycall_time, flush=True)
+  set_value:
+    on_init:
+      - share:
+        - absolute_time: 0.0
+    on_data:
+      iter:
+        - set:
+          - absolute_time: '(${iter} + ${iter_offset}) * ${deltat}'
+    on_finalize:
+      - release: [absolute_time]
+  decl_hdf5:
+    - file: '${fdistribu_filename}'
+      communicator: $MPI_COMM_WORLD
+      on_event: [read_fdistribu]
+      datasets:
+        fdistribu:
+          type: array
+          subtype: double
+          size: ['$Nkinspecies', '$MeshX_extents[0]', '$MeshY_extents[0]', '$MeshVx_extents[0]', '$MeshVy_extents[0]']
+      read:
+        fdistribu:
+          dataset_selection:
+            size: [ '$local_fdistribu_extents[0]', '$local_fdistribu_extents[1]', '$local_fdistribu_extents[2]', '$local_fdistribu_extents[3]', '$local_fdistribu_extents[4]' ]
+            start: ['$local_fdistribu_starts[0]', '$local_fdistribu_starts[1]', '$local_fdistribu_starts[2]', '$local_fdistribu_starts[3]', '$local_fdistribu_starts[4]']
+  #trace: ~

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch the compression mini-app together with the deisa analytics (diagnostics.py).
+# Launch gys_deisa_bench together with the deisa in-situ analytics (diagnostics.py).
 #
 # Usage:
 #   ./deisa-dask_launch_script.sh [SIMU_NODES] [DASK_WORKERS] [GYSELA_PARAMS] [PDI_CONFIG] [ANALYTICS_FILE]
@@ -20,7 +20,7 @@ ANALYTICS_ARG=${5:-}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd $SCRIPT_DIR/../.. && pwd)"
 
-# Resolve the toolchain environment the same way launch_benchmark.py does.
+# Pick the toolchain environment of the current site (Adastra genoa, otherwise Persee xeon).
 if [ -n "$(command -v scontrol)" ] && scontrol show config 2>/dev/null | grep -qi adastra; then
     SITE="adastra"
     ARCH="genoa"
@@ -82,7 +82,7 @@ python3 $ANALYTICS_FILE &
 analytics_pid=$!
 
 echo "Launch simulation"
-srun -n $SIMU_NODES $BASE_DIR/build/simulations/compression/gys_compress \
+srun -n $SIMU_NODES $BASE_DIR/build/simulations/deisa_bench/gys_deisa_bench \
 	$SCRIPT_DIR/$GYSELA_PARAMS \
 	$SCRIPT_DIR/$PDI_CONFIG &
 simu_pid=$!

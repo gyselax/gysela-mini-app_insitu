@@ -8,11 +8,7 @@ from pathlib import Path
 import dask.array as da
 import numpy as np
 from deisa.dask import Deisa
-from distributed import get_client
 from distributed.diagnostics import MemorySampler
-
-from processing.compression import compression_diagnostics
-from processing import reduced_diagnostics
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -108,7 +104,8 @@ def poisson_fft(n, grid):
     In Fourier space: -(kx^2 + ky^2) * phi_hat(k) = rho_hat(k)
     phi_hat(0,0) = 0  (gauge condition)
     """
-    rho_hat = da.fft.fft2(n - 1.0)
+    # fft2 needs a single chunk along the transformed axes
+    rho_hat = da.fft.fft2((n - 1.0).rechunk(-1))
 
     KX, KY = da.meshgrid(grid.kx, grid.ky, indexing="ij")
     k2 = KX ** 2 + KY ** 2
@@ -129,7 +126,7 @@ def electric_field_from_potential(phi, grid):
       E_hat_y(k) = -1j * ky * phi_hat(k)
     Returns array of shape (Nx, Ny, 2).
     """
-    phi_hat = da.fft.fft2(phi)
+    phi_hat = da.fft.fft2(phi.rechunk(-1))
     KX, KY = da.meshgrid(grid.kx, grid.ky, indexing="ij")
     Ex = da.real(da.fft.ifft2(-1j * KX * phi_hat))
     Ey = da.real(da.fft.ifft2(-1j * KY * phi_hat))
@@ -165,12 +162,8 @@ def measure(cfg, f, Efield, it, t_actual):
     momentum_x = da.sum(f * vx_bc) * grid.dV_4D
     momentum_y = da.sum(f * vy_bc) * grid.dV_4D
 
-    client = get_client()
-    futures = client.compute([
-        epot, ekin, l2norm_sq, mass, momentum_x, momentum_y
-    ])
     epot, ekin, l2norm_sq, mass, momentum_x, momentum_y = map(
-        float, deisa.client.gather(futures)
+        float, da.compute(epot, ekin, l2norm_sq, mass, momentum_x, momentum_y)
     )
 
     data = {
@@ -179,9 +172,9 @@ def measure(cfg, f, Efield, it, t_actual):
         "ekin":       ekin,
         "epot":       epot,
         "etot":       ekin + epot,
-        "l2norm":     float(da.sqrt(l2norm_sq)),
+        "l2norm":     float(np.sqrt(l2norm_sq)),
         "mass":       mass,
-        "momentum":   float(da.hypot(momentum_x, momentum_y)),
+        "momentum":   float(np.hypot(momentum_x, momentum_y)),
         "momentum_x": momentum_x,
         "momentum_y": momentum_y,
     }
@@ -202,66 +195,38 @@ def measure(cfg, f, Efield, it, t_actual):
 
 deisa = Deisa()
 
-compression_time = 0.0
 diagnostics_time = 0.0
-
-@deisa.register("fdistribu_offline")
-def compute_offline_compression(fdistribu_chunks):
-    global compression_time
-    t0 = time.time()
-
-    timestep = int(fdistribu_chunks[0].t)
-    
-    print(f"Starting compression of iter {timestep} at time {time.time()}", flush=True)
-    compression_diagnostics.run_offline_compression_on_global_array(fdistribu_chunks[0], timestep)
-    print(f"Finished compression of iter {timestep} at time {time.time()}", flush=True)
-
-    compression_time += time.time() - t0
-
-@deisa.register("fdistribu_reduced", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy")
-def compute_reduced_diagnostics(reduced, deltat, mx, my, mvx, mvy):
-    timestep = int(reduced[0].t)
-    t_actual = timestep * float(deltat[0][0].compute())
-
-    dV_4D = (GridConfig.spacing(mx[0]) * GridConfig.spacing(my[0])
-              * GridConfig.spacing(mvx[0]) * GridConfig.spacing(mvy[0]))
-
-    partials = np.asarray(reduced[0].sum(axis=0))  # (n_ranks, Nsp, 5) -> (Nsp, 5)
-
-    reduced_diagnostics.write_diagnostics_rows(partials, dV_4D, timestep, t_actual, _INITIALIZED_DIAG_FILES)
 
 
 @deisa.register("fdistribu", "absolute_time", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy")
-def compute_diagnostics(fdistribu, time, deltat, mx, my, mvx, mvy):
+def compute_diagnostics(fdistribu, absolute_time, deltat, MeshX, MeshY, MeshVx, MeshVy):
     global diagnostics_time
     t0 = time.time()
 
     if _MEASURE_CFG is None:
-        init_measure_config(
-            x  = mx[0],
-            y  = my[0],
-            vx = mvx[0],
-            vy = mvy[0],
-        )
+        x, y, vx, vy = da.compute(MeshX[-1], MeshY[-1], MeshVx[-1], MeshVy[-1])
+        init_measure_config(x=x, y=y, vx=vx, vy=vy)
 
-    # This avoids a race condition conflict on persee (sim runs faster then the diagnostics
-    # and republishes t_actual before the one attached to the fdistribu chunk could be used)
-    timestep  = int(fdistribu[0].t)
-    t_actual = timestep * float(deltat[0][0].compute())
+    # The time is rebuilt from the iteration of fdistribu: absolute_time may already
+    # hold a later iteration when the simulation runs ahead of the analytics.
+    timestep = int(fdistribu[-1].t)
+    (deltat_value,) = da.compute(deltat[-1][0])
+    t_actual = timestep * float(deltat_value)
 
     cfg = get_measure_config()
 
-    n      = density(fdistribu[0], cfg.grid)
+    n      = density(fdistribu[-1], cfg.grid)
     phi    = poisson_fft(n, cfg.grid)
     Efield = electric_field_from_potential(phi, cfg.grid)
 
-    Nsp = fdistribu[0].shape[0]
+    Nsp = fdistribu[-1].shape[0]
     for isp in range(Nsp):
         data_dir = cfg.paths.data_dir if Nsp == 1 else cfg.paths.data_dir / f"species_{isp}"
         sp_cfg = Config(paths=PathsConfig(data_dir), grid=cfg.grid)
-        measure(sp_cfg, fdistribu[0][isp], Efield, timestep, t_actual)
+        measure(sp_cfg, fdistribu[-1][isp], Efield, timestep, t_actual)
 
     diagnostics_time += time.time() - t0
+
 
 samplers = {
     "all_callbacks": MemorySampler(),
@@ -277,7 +242,6 @@ with (
     deisa.execute_callbacks()
 
     print("Time analytics:", time.time() - t0, flush=True)
-    print("Time compression:", compression_time, flush=True)
     print("Time diagnostics:", diagnostics_time, flush=True)
 # Save plots
 plots = {

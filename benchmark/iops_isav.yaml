@@ -5,16 +5,16 @@ benchmark:
   search_method: "exhaustive"
   executor: "local"
   cache_file: "./iops_gys.db"
-  cache_exclude_vars: ["gys_compress_output"]
+  cache_exclude_vars: ["gys_deisa_bench_output"]
 
 vars:
   #pfs_path:
   #  type: str
   #  sweep:
   #    mode: list
-  #    values: ["{{ execution_dir }}/gys_compress_path/"]
+  #    values: ["{{ execution_dir }}/gys_deisa_bench_path/"]
 
-  gys_compress_output:
+  gys_deisa_bench_output:
     type: str
     expr: "{{ execution_dir }}/slurm.log"
 
@@ -110,12 +110,6 @@ vars:
       mode: list
       values: [50]
 
-  compression_period:
-    type: int
-    sweep:
-      mode: list
-      values: [26]
-
   nbiter_diag:
     type: int
     sweep:
@@ -126,10 +120,10 @@ command:
   template: "dask worker"
 
 scripts:
-  - name: "gys_compress_IOPS_benchmark"
+  - name: "gys_deisa_bench_IOPS_benchmark"
     inputs:
-      - name: "gys_compress_config"
-        path: "{{ execution_dir }}/gys_compress.yaml"
+      - name: "gys_deisa_bench_config"
+        path: "{{ execution_dir }}/gys_deisa_bench.yaml"
         template: |
           Input:
             case: landau_damping #landau_damping
@@ -164,17 +158,14 @@ scripts:
             deltat: 0.25
             nbiter: {{ nbiter }}
 
-          CompressionBenchmark:
-            compression_period: {{ compression_period }}
-
           Output:
-            nbiter_diag: {{ nbiter_diag }}  # diagnostics every N timesteps (must divide compression_period)
+            nbiter_diag: {{ nbiter_diag }}  # diagnostics every N timesteps
 
     script_template: |
-      mpirun {{ command.template }} >> {{ gys_compress_output }} >&1
+      mpirun {{ command.template }} >> {{ gys_deisa_bench_output }} >&1
 
     parser:
-      file: "{{ gys_compress_output }}"
+      file: "{{ gys_deisa_bench_output }}"
       metrics:
         - name: time_pycall
           type: float
@@ -185,10 +176,6 @@ scripts:
         - name: time_full_simulation
           type: float
         - name: time_analytics
-          type: float
-        - name: time_post_hoc
-          type: float
-        - name: time_compression
           type: float
         - name: time_diagnostics
           type: float
@@ -217,8 +204,6 @@ scripts:
             time_bridge_init = None
             time_full_simulation = None
             time_analytics = None
-            time_post_hoc = None
-            time_compression = None
             time_diagnostics = None
             time_write = None
             time_total = None
@@ -233,10 +218,6 @@ scripts:
                 time_full_simulation = float(line.split("Time full simulation:")[1].strip().rstrip('s'))
               elif "Time analytics:" in line:
                 time_analytics = float(line.split("Time analytics:")[1].strip().rstrip('s'))
-              elif "Time post-hoc diagnostics:" in line:
-                time_post_hoc = float(line.split("Time post-hoc diagnostics:")[1].strip().rstrip('s'))
-              elif "Time compression:" in line:
-                time_compression = float(line.split("Time compression:")[1].strip().rstrip('s'))
               elif "Time diagnostics:" in line:
                 time_diagnostics = float(line.split("Time diagnostics:")[1].strip().rstrip('s'))
               elif "Time write:" in line:
@@ -250,8 +231,6 @@ scripts:
               "time_bridge_init": time_bridge_init,
               "time_full_simulation": time_full_simulation,
               "time_analytics": time_analytics,
-              "time_post_hoc": time_post_hoc,
-              "time_compression": time_compression,
               "time_diagnostics": time_diagnostics,
               "time_write": time_write,
               "time_total": time_total,
@@ -260,7 +239,7 @@ scripts:
 output:
   sink:
     type: csv
-    path: "{{ workdir }}/results_gys_compress.csv"
+    path: "{{ workdir }}/results_gys_deisa_bench.csv"
 
 machines:
   adastra-genoa:
@@ -276,10 +255,10 @@ machines:
         type: int
         expr: "{{ threads_per_node // ranks_per_node }}"
     scripts:
-      - name: "gys_compress_IOPS_benchmark"
+      - name: "gys_deisa_bench_IOPS_benchmark"
         script_template: |
           #!/bin/bash
-          #SBATCH --job-name=gys_compress
+          #SBATCH --job-name=gys_deisa_bench
           #SBATCH --output=slurm.log
           #SBATCH --nodes={{ nodes  }}
           #SBATCH --time=6:30:00
@@ -301,8 +280,6 @@ machines:
           export OMP_PROC_BIND=close
           export OMP_PLACES=threads
           export OMP_NUM_THREADS={{ threads_per_rank }}
-
-          export GYS_DIAG_MODE={{ diag_mode }}
 
           {% if diag_mode == 1 and deisa_version == 'dask' %}
           export DASK_DISTRIBUTED__COMM__TIMEOUTS__CONNECT=60s
@@ -361,9 +338,9 @@ machines:
                 ranks/node, $SIMU_RANKS ranks total)"
           srun -l -N $SIMU_NODES -n $SIMU_RANKS --cpus-per-task={{ threads_per_rank }} \
             --threads-per-core=2 --cpu-bind=ldoms -r ${REL} \
-            $BASE_DIR/build/simulations/compression/gys_compress \
-            {{ execution_dir }}/gys_compress.yaml \
-            $BASE_DIR/simulations/compression/params/{{ pdi_yaml }} &
+            $BASE_DIR/build/simulations/deisa_bench/gys_deisa_bench \
+            {{ execution_dir }}/gys_deisa_bench.yaml \
+            $BASE_DIR/simulations/deisa_bench/params/{{ pdi_yaml }} &
           simu_pid=$!
 
           {% if diag_mode == 1 %}
@@ -372,11 +349,6 @@ machines:
           {% endif %}
           wait ${simu_pid}
           echo "Simulation over"
-
-          {% if diag_mode == 2 %}
-          python3 $BASE_DIR/processing/finalize_reduced_diagnostics.py \
-            {{ execution_dir }}
-          {% endif %}
 
   adastra-mi250:
     benchmark:
@@ -396,7 +368,7 @@ machines:
           mode: list
           values: [8]
     scripts:
-      - name: "gys_compress_IOPS_benchmark"
+      - name: "gys_deisa_bench_IOPS_benchmark"
         inputs:
           - name: mi250_gpu_binding
             path: "{{ execution_dir }}/mi250_gpu_binding.sh"
@@ -411,7 +383,7 @@ machines:
               exec numactl --localalloc --physcpubind="${CPU_SET}" -- "${@}"
         script_template: |
           #!/bin/bash
-          #SBATCH --job-name=gys_compress
+          #SBATCH --job-name=gys_deisa_bench
           #SBATCH --output=slurm.log
           #SBATCH --nodes={{ nodes  }}
           #SBATCH --time=01:30:00
@@ -429,8 +401,6 @@ machines:
  
           unset LUA_PATH LUA_CPATH
  
-          export GYS_DIAG_MODE={{ diag_mode }}
-
           {% if diag_mode == 1 and deisa_version == 'dask' %}
           export DASK_DISTRIBUTED__CLIENT__HEARTBEAT=7200s
 
@@ -494,9 +464,9 @@ machines:
           srun -N $SIMU_NODES -n $SIMU_RANKS --ntasks-per-node={{ ranks_per_node }}\
             --cpu-bind=none --mem-bind=none --mem=0 -r ${REL} \
             {{ inputs.mi250_gpu_binding.path }} \
-            $BASE_DIR/build/simulations/compression/gys_compress \
-            {{ execution_dir }}/gys_compress.yaml \
-            $BASE_DIR/simulations/compression/params/{{ pdi_yaml }} &
+            $BASE_DIR/build/simulations/deisa_bench/gys_deisa_bench \
+            {{ execution_dir }}/gys_deisa_bench.yaml \
+            $BASE_DIR/simulations/deisa_bench/params/{{ pdi_yaml }} &
           simu_pid=$!
  
           {% if diag_mode == 1 and deisa_version == 'dask' %}
@@ -505,8 +475,3 @@ machines:
           {% endif %}
           wait ${simu_pid}
           echo "Simulation over"
-
-          {% if diag_mode == 2 %}
-          python3 $BASE_DIR/processing/finalize_reduced_diagnostics.py \
-            {{ execution_dir }}
-          {% endif %}

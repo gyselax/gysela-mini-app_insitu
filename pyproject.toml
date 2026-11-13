@@ -12,34 +12,21 @@ dependencies = [
     "numpy",
     "h5py",
     "matplotlib",
-    "scikit-learn",
-    "PyYAML",
+    "pandas",
     "xarray",
     "dask",
     "h5netcdf",
-    "netcdf4",
-    "tqdm",
     "iops-benchmark",
     "iops-benchmark[bayesian]",
     "distributed==2025.5.0",
-    "rich",
-    "flax>=0.12.7",
-    "optax>=0.2.8",
-    "jax>=0.4.28",
-    "equinox>=0.1.3",
-    "scimba",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
-cuda12 = ["jax[cuda12]"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-
-[project.scripts]
-gysela-mini-app = "processing.utils.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "."}
