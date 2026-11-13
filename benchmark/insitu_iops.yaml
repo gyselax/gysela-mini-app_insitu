@@ -603,8 +603,7 @@ machines:
           SIM_ANCHOR_CPUS=(0 8 16 24 32 40 48 56) # 1 gysela CPU per GCD
           {% if deisa_version == "dask" %}
           DASK_ANALYTICS_CPUS=56                   # CPUs left to Dask on each node
-          DASK_CPUS=${DASK_CPUS:-48}                # CPUs Dask is told it owns
-          DASK_CPUS=${RAY_CPUS:-48}                # CPUs the Dask Scheduler owns (analytics takes the rest)
+          DASK_CPUS=${DASK_CPUS:-48}                # CPUs the Dask Scheduler owns (analytics takes the rest)
           DASK_WORKER_CPUS=${RAY_WORKER_CPUS:-${DASK_ANALYTICS_CPUS}} # worker nodes run no analytics,
                                                   # so their DASK workers take every free CPU
           ANALYTICS_CPUS=$((DASK_ANALYTICS_CPUS - DASK_CPUS))
@@ -845,11 +844,11 @@ machines:
               --local-directory /tmp --scheduler-file={{ schefile }} \
             >"${LOG_DIR}/dask-worker.log" 2>&1 &
           WORKER_PID=$!
-          echo -n "Waiting for ${NNODES} Dask workers "
+          echo -n "Waiting for ${NNODES - 1} Dask workers "
           joined=0
           for _ in $(seq 1 60); do
             joined=$(cat "${LOG_DIR}"/dask-worker*.log 2>/dev/null | grep -c "Registered to:" || true)
-            ((joined >= NNODES)) && break
+            ((joined >= NNODES - 1 )) && break
             echo -n "."
             sleep 2
           done
@@ -899,8 +898,8 @@ machines:
           cleanup() {
             set +e
             echo "Stopping Dask..."
-            kill ${WORKER_PID:-} ${SCHEDULER_WORKER_PID:-} ${SCHEDULER_PID:-} 2>/dev/null
-            wait ${WORKER_PID:-} ${SCHEDULER_WORKER_PID:-} ${SCHEDULER_PID:-} 2>/dev/null
+            kill ${WORKER_PID:-} ${SCHEDULER_PID:-} 2>/dev/null
+            wait ${WORKER_PID:-} ${SCHEDULER_PID:-} 2>/dev/null
             if [[ -f "${SLURM_BOOT_LOG}" ]]; then
               mv -f "${SLURM_BOOT_LOG}" "${LOG_DIR}/slurm.log" 2>/dev/null
             fi
