@@ -577,6 +577,8 @@ machines:
 
           unset LUA_PATH LUA_CPATH
 
+          export DEISA_VERSION={{ deisa_version }}
+
           export GYS_DIAG_MODE={{ diag_mode }}
           export OMP_NUM_THREADS=1
           export MPICH_GPU_SUPPORT_ENABLED=1

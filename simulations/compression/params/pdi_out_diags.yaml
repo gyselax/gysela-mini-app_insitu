@@ -82,7 +82,17 @@ plugins:
           import time
           import numpy as np
           from mpi4py import MPI
-          from deisa.dask import Bridge
+          import os
+
+          DEISA_VERSION = os.environ.get("DEISA_VERSION", "dask").lower()
+
+          if DEISA_VERSION == "ray":
+            from deisa.ray import Bridge
+          elif DEISA_VERSION == "dask":
+            from deisa.dask import Bridge
+          else:
+              raise ValueError(f"DEISA_VERSION must be 'dask' or 'ray', got {DEISA_VERSION!r}.")
+
           from processing.compression import compression_diagnostics
           from processing import reduced_diagnostics
           import pdi

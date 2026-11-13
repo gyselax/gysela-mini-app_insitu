@@ -1,0 +1,1024 @@
+benchmark:
+  name: "ISAV 2026"
+  workdir: "./"
+  repetitions: 1
+  search_method: "exhaustive"
+  executor: "local"
+  cache_file: "./iops_gys.db"
+  cache_exclude_vars: ["gys_compress_output"]
+
+vars:
+  #pfs_path:
+  #  type: str
+  #  sweep:
+  #    mode: list
+  #    values: ["{{ execution_dir }}/gys_compress_path/"]
+
+  gys_compress_output:
+    type: str
+    expr: "{{ execution_dir }}/slurm.log"
+
+  schefile:
+    type: str
+    expr: "{{ execution_dir }}/scheduler.json"
+
+  diag_mode:
+    type: int
+    sweep:
+      mode: list
+      values: [0, 1]
+
+  deisa_version:
+    type: str
+    sweep:
+      mode: list
+      values: ["dask", "ray"] #, "ray"]
+    when: "diag_mode == 1"
+    default: "none"
+
+  pdi_yaml:
+    type: str
+    expr: >-
+      {% if diag_mode == 1 %}pdi_out_diags.yaml{% else %}pdi_out.yaml{% endif %}
+  
+  simu_index:
+    type: int
+    sweep:
+      mode: list
+      values: [1]
+
+  mpi_ranks:
+    type: int
+    expr: "{{[8, 16, 16, 32, 64, 128, 256, 512, 1024][simu_index]}}"
+      #expr: "{{[8, 8, 16, 32, 64, 128, 256, 512, 1024][simu_index]}}"
+
+  x_ncells:
+    type: int
+    expr: "{{[48, 512, 512, 1024, 1024, 2048, 2048, 4096, 4096][simu_index]}}"
+
+  y_ncells:
+    type: int
+    expr: "{{[48, 512, 1024, 1024, 2048, 2048, 4096, 4096, 8192][simu_index]}}"
+
+  vx_ncells:
+    type: int
+    expr: "{{[31, 127, 127, 127, 127, 127, 127, 127, 127][simu_index]}}"
+      #expr: "{{[31, 63, 63, 63, 63, 63, 63, 63, 63][simu_index]}}"
+
+  vy_ncells:
+    type: int
+    expr: "{{[31, 127, 127, 127, 127, 127, 127, 127, 127][simu_index]}}"
+      #expr: "{{[31, 63, 63, 63, 63, 63, 63, 63, 63][simu_index]}}"
+
+  analytics_index:
+    type: int
+    sweep:
+      mode: list
+      values: [2] #[1, 2, 3, 4]
+    when: "simu_index <= 5"
+    default: 2
+
+  # Dask workers run in situ on every simulation node (one per NUMA domain).
+  # Overridden per machine: 4 on MI250, 8 on GENOA.
+  workers_per_node:
+    type: int
+    expr: "1"
+      
+    #{% if deisa_version == 'dask' %}{{[1, 2, 4, 8, 16, 32][analytics_index] }}{% else %}0{% endif %}
+    #{% if deisa_version == 'dask' %}{{[1, 1, 1, 1, 2, 4, 8, 16, 32][simu_index] }}{% else %}0{% endif %}
+    
+
+
+  ranks_per_node:
+    type: int
+    sweep:
+      mode: list
+      values: [8] # or 2 ?
+
+  nodes:
+    type: int
+    expr: "{{ mpi_ranks // ranks_per_node }}"
+
+  node_memory_gib:
+    type: int
+    expr: "256"
+
+  fdistrib_gib_per_node:
+    type: float
+    expr: "{{ x_ncells * y_ncells * ( vx_ncells+1 ) * ( vy_ncells+1 ) * 8 / (mpi_ranks // ranks_per_node) / 1024**3 }}"
+
+  # Per-worker memory limit: (node memory - 2 x local distribution function) / workers per node
+  worker_memory_gib:
+    type: int
+    expr: >-
+      {% if workers_per_node > 0 %}{{ ((node_memory_gib - 2 * fdistrib_gib_per_node) / workers_per_node) | int }}{% else %}0{% endif %}
+
+  tasks_per_nodes:
+    type: int
+    sweep:
+      mode: list
+      values: [8]
+
+  nbiter:
+    type: int
+    sweep:
+      mode: list
+      values: [50]
+
+  compression_period:
+    type: int
+    sweep:
+      mode: list
+      values: [26]
+
+  nbiter_diag:
+    type: int
+    sweep:
+      mode: list
+      values: [2]
+
+command:
+  template: "dask worker"
+
+scripts:
+  - name: "gys_compress_IOPS_benchmark"
+    inputs:
+      - name: "gys_compress_config"
+        path: "{{ execution_dir }}/gys_compress.yaml"
+        template: |
+          Input:
+            case: landau_damping #landau_damping
+            fdistribu_filename: "none"
+            nb_restart: 0
+            iter_offset: 0
+
+          SplineMesh:
+            x_min: 0.0
+            x_max: 12.56637061435917
+            x_ncells: {{ x_ncells }}
+            y_min: 0.0
+            y_max: 12.56637061435917
+            y_ncells : {{ y_ncells }}
+            vx_min: -6.0
+            vx_max: +6.0
+            vx_ncells: {{ vx_ncells }}
+            vy_min: -6.0
+            vy_max: +6.0
+            vy_ncells: {{ vy_ncells }}
+
+          SpeciesInfo:
+          - charge: -1.
+            mass: 0.0005
+            density_eq: 1.
+            temperature_eq: 1.
+            mean_velocity_eq: 0.
+            perturb_amplitude: 0.05
+            perturb_mode: 1
+
+          Algorithm:
+            deltat: 0.25
+            nbiter: {{ nbiter }}
+
+          CompressionBenchmark:
+            compression_period: {{ compression_period }}
+
+          Output:
+            nbiter_diag: {{ nbiter_diag }}  # diagnostics every N timesteps (must divide compression_period)
+
+    parser:
+      file: "{{ gys_compress_output }}"
+      metrics:
+        - name: time_pycall
+          type: float
+        - name: time_simulation_init
+          type: float
+        - name: time_bridge_init
+          type: float
+        - name: time_full_simulation
+          type: float
+        - name: time_analytics
+          type: float
+        - name: time_post_hoc
+          type: float
+        - name: time_compression
+          type: float
+        - name: time_diagnostics
+          type: float
+        - name: time_write
+          type: float
+        - name: time_total
+          type: float
+      parser_script: |
+        import json
+        import os
+        import re
+        def _folder_size(path):
+          total = 0
+          for root, _dirs, files in os.walk(path):
+            for name in files:
+              fp = os.path.join(root, name)
+              if os.path.isfile(fp):
+                total += os.path.getsize(fp)
+          return total
+        
+        def parse(file_path):
+          with open(file_path, "r") as f:
+            lines = f.readlines()
+            time_pycall = None
+            time_simulation_init = None
+            time_bridge_init = None
+            time_full_simulation = None
+            time_analytics = None
+            time_post_hoc = None
+            time_compression = None
+            time_diagnostics = None
+            time_write = None
+            time_total = None
+            for line in lines:
+              if "Time pycall:" in line:
+                time_pycall = float(line.split("Time pycall:")[1].strip().rstrip('s'))
+              elif "Time Simulation initialisation:" in line:
+                time_simulation_init = float(line.split("Time Simulation initialisation:")[1].strip().rstrip('s'))
+              elif "Time Bridge initialisation:" in line:
+                time_bridge_init = float(line.split("Time Bridge initialisation:")[1].strip().rstrip('s'))
+              elif "Time full simulation:" in line:
+                time_full_simulation = float(line.split("Time full simulation:")[1].strip().rstrip('s'))
+              elif "Time analytics:" in line:
+                time_analytics = float(line.split("Time analytics:")[1].strip().rstrip('s'))
+              elif "Time post-hoc diagnostics:" in line:
+                time_post_hoc = float(line.split("Time post-hoc diagnostics:")[1].strip().rstrip('s'))
+              elif "Time compression:" in line:
+                time_compression = float(line.split("Time compression:")[1].strip().rstrip('s'))
+              elif "Time diagnostics:" in line:
+                time_diagnostics = float(line.split("Time diagnostics:")[1].strip().rstrip('s'))
+              elif "Time write:" in line:
+                time_write = float(line.split("Time write:")[1].strip().rstrip('s'))
+              elif "Time total:" in line:
+                time_total = float(line.split("Time total:")[1].strip().rstrip('s'))
+
+            return {
+              "time_pycall": time_pycall,
+              "time_simulation_init": time_simulation_init,
+              "time_bridge_init": time_bridge_init,
+              "time_full_simulation": time_full_simulation,
+              "time_analytics": time_analytics,
+              "time_post_hoc": time_post_hoc,
+              "time_compression": time_compression,
+              "time_diagnostics": time_diagnostics,
+              "time_write": time_write,
+              "time_total": time_total,
+            }
+
+output:
+  sink:
+    type: csv
+    path: "{{ workdir }}/results_gys_compress.csv"
+
+machines:
+  adastra-genoa:
+    benchmark:
+      repetitions: 2
+      parallel: 50
+      executor: "slurm"
+    vars:
+      threads_per_node:
+        type: int
+        expr: "384"
+      threads_per_rank:
+        type: int
+        expr: >-
+          {% if workers_per_node > 0 %}{{ (threads_per_node * 3 // 4) // ranks_per_node }}{% else %}{{ threads_per_node // ranks_per_node }}{% endif %}
+      workers_per_node:
+        type: int
+        expr: >-
+          {% if deisa_version == 'dask' %}8{% else %}0{% endif %}
+      node_memory_gib:
+        type: int
+        expr: "768"
+    scripts:
+      - name: "gys_compress_IOPS_benchmark"
+        inputs:
+          # 8 ranks/node, one per NUMA domain (24 cores = 3 CCDs of 8).
+          # With dask: cores 0-5 of each CCD + SMT siblings (core + 192).
+          - name: genoa_simu_binding
+            path: "{{ execution_dir }}/genoa_simu_binding.sh"
+            mode: "0755"
+            template: |
+              #!/bin/bash
+              set -eu
+              {% if workers_per_node > 0 %}
+              AFFINITY_NUMACTL=('0-5,8-13,16-21,192-197,200-205,208-213' '24-29,32-37,40-45,216-221,224-229,232-237' '48-53,56-61,64-69,240-245,248-253,256-261' '72-77,80-85,88-93,264-269,272-277,280-285' '96-101,104-109,112-117,288-293,296-301,304-309' '120-125,128-133,136-141,312-317,320-325,328-333' '144-149,152-157,160-165,336-341,344-349,352-357' '168-173,176-181,184-189,360-365,368-373,376-381')
+              {% else %}
+              AFFINITY_NUMACTL=('0-23,192-215' '24-47,216-239' '48-71,240-263' '72-95,264-287' '96-119,288-311' '120-143,312-335' '144-167,336-359' '168-191,360-383')
+              {% endif %}
+              CPU_SET="${AFFINITY_NUMACTL[$SLURM_LOCALID]}"
+              exec numactl --localalloc --physcpubind="${CPU_SET}" -- "${@}"
+          # 8 workers/node, one per NUMA domain: cores 6-7 of each of its 3 CCDs
+          - name: genoa_dask_binding
+            path: "{{ execution_dir }}/genoa_dask_binding.sh"
+            mode: "0755"
+            template: |
+              #!/bin/bash
+              set -eu
+              AFFINITY_NUMACTL=('6-7,14-15,22-23' '30-31,38-39,46-47' '54-55,62-63,70-71' '78-79,86-87,94-95' '102-103,110-111,118-119' '126-127,134-135,142-143' '150-151,158-159,166-167' '174-175,182-183,190-191')
+              export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+              CPU_SET="${AFFINITY_NUMACTL[$SLURM_LOCALID]}"
+              exec numactl --localalloc --physcpubind="${CPU_SET}" -- "${@}"
+        script_template: |
+          #!/bin/bash
+          #SBATCH --job-name=gys_compress
+          #SBATCH --output=slurm.log
+          #SBATCH --nodes={{ nodes  }}
+          #SBATCH --time=0:30:00
+          #SBATCH --constraint="GENOA"
+          #SBATCH --account=gen2224
+          #SBATCH --exclusive
+
+          set -e
+          set -o pipefail
+
+          BASE_DIR=/lus/work/CT6/cad17895/ilucas/gysela-mini-app_io 
+
+          source $BASE_DIR/toolchains/adastra/genoa/environment.sh
+          source $BASE_DIR/.gys_env/bin/activate
+
+          unset LUA_PATH LUA_CPATH
+          
+          export OMP_DISPLAY_AFFINITY=true
+          export OMP_PROC_BIND=close
+          export OMP_PLACES=threads
+          export OMP_NUM_THREADS={{ threads_per_rank }}
+
+          export GYS_DIAG_MODE={{ diag_mode }}
+
+          COMMON="--overlap --cpu-bind=none --mem-bind=none"
+
+          {% if diag_mode == 1 and deisa_version == 'dask' %}
+          export DASK_DISTRIBUTED__COMM__TIMEOUTS__CONNECT=60s
+          export DASK_DISTRIBUTED__COMM__TIMEOUTS__TCP=60s
+
+          srun ${COMMON} -l -N 1 -n 1 --cpus-per-task={{ threads_per_node }} \
+            --threads-per-core=2 -r 0 \
+            numactl --localalloc --physcpubind=0-7 \
+            dask scheduler \
+              --scheduler-file={{ schefile }} \
+              --interface hsn0 &
+
+          while ! [ -f {{ schefile }} ]; do
+            sleep 1
+            echo -n .
+          done 
+          
+          export DEISA_DASK_SCHEDULER_ADDRESS=$(jq -r '.["address"]' {{ schefile }})
+
+          echo "Launch {{ (nodes - 1) * workers_per_node }} dask worker(s)"
+          srun ${COMMON} -l -N {{ nodes - 1 }} \
+            --ntasks-per-node={{ workers_per_node }} \
+            --cpus-per-task={{ threads_per_node // workers_per_node }} \
+            --threads-per-core=2 --mpi=none -r 1 \
+            {{ inputs.genoa_dask_binding.path }} \
+            dask worker --nworkers 1 \
+              --nthreads 6 \
+              --memory-limit {{ worker_memory_gib }}GiB \
+              --interface hsn0 \
+              --local-directory /tmp  \
+              --scheduler-file={{ schefile }} &
+          sleep 30
+
+          echo "Launch analytics"
+          numactl --localalloc --physcpubind=8-191 \
+            python3 $BASE_DIR/src/python/diagnostics.py &
+          analytics_pid=$!
+          sleep 60
+
+          REL=1
+          SIMU_NODES={{ nodes - 1 }}
+          SIMU_RANKS=$(( SIMU_NODES * {{ ranks_per_node }} ))
+          {% else %}
+          REL=0
+          SIMU_NODES={{ nodes }}
+          SIMU_RANKS=$(( SIMU_NODES * {{ ranks_per_node }} ))
+          {% endif %}
+
+          echo "Launch simu on $SIMU_NODES nodes ({{ ranks_per_node }} \
+                ranks/node, $SIMU_RANKS ranks total)"
+          srun ${COMMON} -l -N $SIMU_NODES -n $SIMU_RANKS \
+            --ntasks-per-node={{ ranks_per_node }} \
+            --cpus-per-task={{ threads_per_node // ranks_per_node }} \
+            --threads-per-core=2 -r ${REL} \
+            {{ inputs.genoa_simu_binding.path }} \
+            $BASE_DIR/build/apps/compression/gys_compress \
+            {{ execution_dir }}/gys_compress.yaml \
+            $BASE_DIR/apps/compression/{{ pdi_yaml }} &
+          simu_pid=$!
+
+          {% if diag_mode == 1 %}
+          wait ${analytics_pid}
+          echo "Analytics over"
+          {% endif %}
+          wait ${simu_pid}
+          echo "Simulation over"
+
+          {% if diag_mode == 2 %}
+          python3 $BASE_DIR/src/python/finalize_reduced_diagnostics.py \
+            {{ execution_dir }}
+          {% endif %}
+
+  adastra-mi250:
+    benchmark:
+      repetitions: 1
+      parallel: 50
+      executor: "slurm"
+    vars:
+      threads_per_node:
+        type: int
+        expr: "256"
+      threads_per_rank:
+        type: int
+        expr: "{{ threads_per_node // ranks_per_node }}"
+      ranks_per_node:
+        type: int
+        sweep:
+          mode: list
+          values: [8]
+      node_memory_gib:
+        type: int
+        expr: "256"
+    scripts:
+      - name: "gys_compress_IOPS_benchmark"
+        inputs:
+          # 1 GCD/rank. With dask: cores 0-5 of each CCD + SMT siblings (core + 64).
+          - name: mi250_gpu_binding
+            path: "{{ execution_dir }}/mi250_gpu_binding.sh"
+            mode: "0755"
+            template: |
+              #!/bin/bash
+              set -eu
+              AFFINITY_NUMACTL=('48' '56' '16' '24' '0' '8' '32' '40')
+              AFFINITY_GPU=('0' '1' '2' '3' '4' '5' '6' '7')
+              CPU_SET="${AFFINITY_NUMACTL[$SLURM_LOCALID]}"
+              unset ROCR_VISIBLE_DEVICES
+              export HIP_VISIBLE_DEVICES="${AFFINITY_GPU[$SLURM_LOCALID]}"
+              exec numactl --localalloc --physcpubind="${CPU_SET}" -- "${@}"
+        script_template: |
+          #!/bin/bash
+          #SBATCH --job-name=gys_compress
+          #SBATCH --output={{ execution_dir }}/slurm-%j.log
+          #SBATCH --nodes={{ nodes  }}
+          #SBATCH --time=00:15:00
+          #SBATCH --gpus-per-node=8
+          #SBATCH --constraint="MI250"
+          #SBATCH --account=gen2224
+          #SBATCH --exclusive
+
+          set -e
+          set -o pipefail
+          set -x
+ 
+          export DEISA_VERSION={{ deisa_version }}
+          export PYTHONPATH="${BASE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+
+          {% if deisa_version == "dask" %}
+          # =============================================================================
+          # gysela-mini-app (compression) + deisa-dask in-situ analytics
+          # Adastra / MI250 partition
+          # =============================================================================
+          #
+          # ---------------------------------------------------------------------------
+          # Resource layout, per MI250 node (64 CPU cores, 8 GCDs)
+          # ---------------------------------------------------------------------------
+          #   * 8 CPUs (0,8,16,24,32,40,48,56) + the 8 GCDs -> gysela-mini-app
+          #        1 MPI rank per GCD, each rank pinned to one CPU + one GCD
+          #   * the remaining 56 CPUs -> Dask + analytics. On the scheduler node they are
+          #     split as DASK_CPUS + ANALYTICS_CPUS = 56, with DASK_CPUS=48 and
+          #     ANALYTICS_CPUS=8 by default: the Dask scheduler is pinned to its 48 CPUs,
+          #     analytics to the 8 CPUs reserved for it. Worker nodes run no
+          #     analytics, so their Dask workers take all 56 free CPUs
+          #     (DASK_WORKER_CPUS), leaving no CPU idle. 
+          # 
+          # ---------------------------------------------------------------------------
+          # Dask scheduler node == worker node
+          # ---------------------------------------------------------------------------
+          # Node 0 hosts the Dask scheduler and is also a normal worker node. 
+          #
+          # ---------------------------------------------------------------------------
+          # Logs
+          # ---------------------------------------------------------------------------
+          # Everything is written under <execution_dir>/job_<job id>_deisa-ray/:
+          #   job.log         script trace (set -x) + general messages
+          #   scheduler.log   Dask scheduler stdout + stderr
+          #   dask-worker.log Dask workers stdout + stderr
+          #   analytics.log   deisa-dask analytics stdout + stderr
+          #   sim.log         gysela-mini-app stdout + stderr (timing metrics)
+          #   slurm.log       Slurm-managed bootstrap log
+          # The working directory is the job folder, so diagnostics.csv and
+          # GYSELALIBXX_*.h5 also land there. At exit, sim.log is copied to
+          # {{ gys_compress_output }} so the IOPS parser can read the metrics.
+          # =============================================================================
+          {% elif deisa_version == "ray" %}
+          # =============================================================================
+          # gysela-mini-app (compression) + deisa-ray in-situ analytics
+          # Adastra / MI250 partition
+          # =============================================================================
+          #
+          # ---------------------------------------------------------------------------
+          # Resource layout, per MI250 node (64 CPU cores, 8 GCDs)
+          # ---------------------------------------------------------------------------
+          #   * 8 CPUs (0,8,16,24,32,40,48,56) + the 8 GCDs -> gysela-mini-app
+          #        1 MPI rank per GCD, each rank pinned to one CPU + one GCD
+          #   * the remaining 56 CPUs -> Ray + analytics. On the head node they are
+          #     split as RAY_CPUS + ANALYTICS_CPUS = 56, with RAY_CPUS=48 and
+          #     ANALYTICS_CPUS=8 by default: the Ray head is pinned to its 48 CPUs,
+          #     analytics to the 8 CPUs reserved for it. Worker nodes run no
+          #     analytics, so their Ray workers take all 56 free CPUs
+          #     (RAY_WORKER_CPUS), leaving no CPU idle. Ray is told its budget
+          #     through `ray start --num-cpus=...`, so Ray tasks never use more
+          #     than the CPUs advertised on the node they run on. Change the split
+          #     with, e.g., `RAY_CPUS=40 sbatch launch-...sh`, or
+          #     `RAY_WORKER_CPUS=48` to leave the last 8 CPUs idle on workers too.
+          #
+          # ---------------------------------------------------------------------------
+          # Ray head node == worker node
+          # ---------------------------------------------------------------------------
+          # Node 0 hosts the Ray head. In Ray the head node is *also* a normal
+          # worker node: `ray start --head` starts a raylet there and Ray will
+          # schedule tasks and actors on it like on any other node. We therefore
+          # do NOT launch a second `ray start --address ...` worker on node 0 --
+          # only nodes 1..N-1 join as workers.
+          #
+          # ---------------------------------------------------------------------------
+          # Logs
+          # ---------------------------------------------------------------------------
+          # Everything is written under <execution_dir>/job_<job id>_deisa/:
+          #   job.log         script trace (set -x) + general messages
+          #   ray-head.log    Ray head   stdout + stderr
+          #   ray-worker.log  Ray workers stdout + stderr
+          #   analytics.log   deisa-ray analytics stdout + stderr
+          #   sim.log         gysela-mini-app stdout + stderr (timing metrics)
+          #   slurm.log       Slurm-managed bootstrap log
+          # The working directory is the job folder, so diagnostics.csv and
+          # GYSELALIBXX_*.h5 also land there. At exit, sim.log is copied to
+          # {{ gys_compress_output }} so the IOPS parser can read the metrics.
+          # =============================================================================
+          {% endif%}
+
+          # -----------------------------------------------------------------------------
+          # Paths
+          # -----------------------------------------------------------------------------
+          # Repo root, resolved from this script's own location (simulations/compression/ -> ../..).
+          #SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          BASE_DIR=${BASE_DIR:-$(cd "{{ execution_dir }}/../../../../.." && pwd)}
+          TOOLCHAIN_ENV=${TOOLCHAIN_ENV:-${BASE_DIR}/toolchains/adastra/mi250/environment.sh}
+          VENV_ACTIVATE=${VENV_ACTIVATE:-${BASE_DIR}/.gys_env/bin/activate}
+
+          GYS_COMPRESS_BIN=${GYS_COMPRESS_BIN:-${BASE_DIR}/build/simulations/compression/gys_compress}
+          {% if diag_mode == 1%}
+          ANALYTICS_SCRIPT=${ANALYTICS_SCRIPT:-${BASE_DIR}/processing/diagnostics.py}
+          {% endif %}
+          PDI_CONFIG=${PDI_CONFIG:-${BASE_DIR}/simulations/compression/params/{{ pdi_yaml }}}
+          GYS_CONF=${GYS_CONF:-{{ execution_dir }}/gys_compress.yaml}
+
+          # Base directory for this run; the job folder below is created inside it
+          # and becomes the working directory.
+          EXECUTION_DIR=${EXECUTION_DIR:-{{ execution_dir }}}
+          GPU_BINDING={{ inputs.mi250_gpu_binding.path }}
+
+          # All logs for this run live in <EXECUTION_DIR>/job_<job id>_deisa/.
+          LOG_DIR=${LOG_DIR:-${EXECUTION_DIR}/job_${SLURM_JOB_ID}_deisa}
+          mkdir -p "${LOG_DIR}"
+
+          # Slurm creates its own output file before the script runs; move it into
+          # the job folder right away (Slurm keeps writing through the same fd).
+          SLURM_BOOT_LOG={{ execution_dir }}/slurm-${SLURM_JOB_ID}.log
+          mv -f "${SLURM_BOOT_LOG}" "${LOG_DIR}/slurm.log" 2>/dev/null || true
+
+          # From here on the script's own stdout/stderr (including `set -x`) goes
+          # into the job folder.
+          exec >>"${LOG_DIR}/job.log" 2>&1
+
+          # -----------------------------------------------------------------------------
+          # Hardware budget
+          # -----------------------------------------------------------------------------
+          RANKS_PER_NODE={{ ranks_per_node }}          # one MPI rank (and one GCD) per rank
+          SIM_ANCHOR_CPUS=(0 8 16 24 32 40 48 56) # 1 gysela CPU per GCD
+          {% if deisa_version == "dask" %}
+          DASK_ANALYTICS_CPUS=56                   # CPUs left to Dask on each node
+          DASK_CPUS=${DASK_CPUS:-48}                # CPUs Dask is told it owns
+          DASK_CPUS=${RAY_CPUS:-48}                # CPUs the Dask Scheduler owns (analytics takes the rest)
+          DASK_WORKER_CPUS=${RAY_WORKER_CPUS:-${DASK_ANALYTICS_CPUS}} # worker nodes run no analytics,
+                                                  # so their DASK workers take every free CPU
+          ANALYTICS_CPUS=$((DASK_ANALYTICS_CPUS - DASK_CPUS))
+
+          if ((DASK_CPUS < 0 || DASK_CPUS > DASK_ANALYTICS_CPUS)); then
+            echo "ERROR: DASK_CPUS must be in [0, ${DASK_ANALYTICS_CPUS}] (got ${DASK_CPUS})" >&2
+            exit 1
+          fi
+          if ((DASK_WORKER_CPUS < 0 || DASK_WORKER_CPUS > DASK_ANALYTICS_CPUS)); then
+            echo "ERROR: DASK_WORKER_CPUS must be in [0, ${DASK_ANALYTICS_CPUS}] (got ${DASK_WORKER_CPUS})" >&2
+            exit 1
+          fi
+
+          # The 56 CPUs not used by the gysela ranks, i.e. every CPU id that is not
+          # one of the anchors (multiples of 8). On the scheduler node they are split into
+          # two disjoint sets: Dask takes the first DASK_CPUS, analytics the remaining
+          # ANALYTICS_CPUS. Worker nodes run no analytics, so their Dask workers take
+          # the first DASK_WORKER_CPUS (all 56 by default), leaving no CPU idle.
+          {% elif deisa_version == "ray" %}
+          RAY_ANALYTICS_CPUS=56                   # CPUs left to Ray + analytics on each node
+          RAY_CPUS=${RAY_CPUS:-48}                # CPUs the Ray head owns (analytics takes the rest)
+          RAY_WORKER_CPUS=${RAY_WORKER_CPUS:-${RAY_ANALYTICS_CPUS}} # worker nodes run no analytics,
+                                                  # so their Ray workers take every free CPU
+          ANALYTICS_CPUS=$((RAY_ANALYTICS_CPUS - RAY_CPUS))
+          RAY_PORT=6379
+
+          if ((RAY_CPUS < 0 || RAY_CPUS > RAY_ANALYTICS_CPUS)); then
+            echo "ERROR: RAY_CPUS must be in [0, ${RAY_ANALYTICS_CPUS}] (got ${RAY_CPUS})" >&2
+            exit 1
+          fi
+          if ((RAY_WORKER_CPUS < 0 || RAY_WORKER_CPUS > RAY_ANALYTICS_CPUS)); then
+            echo "ERROR: RAY_WORKER_CPUS must be in [0, ${RAY_ANALYTICS_CPUS}] (got ${RAY_WORKER_CPUS})" >&2
+            exit 1
+          fi
+
+          # The 56 CPUs not used by the gysela ranks, i.e. every CPU id that is not
+          # one of the anchors (multiples of 8). On the head node they are split into
+          # two disjoint sets: Ray takes the first RAY_CPUS, analytics the remaining
+          # ANALYTICS_CPUS. Worker nodes run no analytics, so their Ray workers take
+          # the first RAY_WORKER_CPUS (all 56 by default), leaving no CPU idle.
+          {% endif %}
+          {% if diag_mode == 1 %}
+          ALL_CPUS=()
+          for ((c = 0; c < 64; c++)); do
+            ((c % 8 == 0)) || ALL_CPUS+=("$c")
+          done
+
+          # Compress a sorted CPU id list into a numactl --physcpubind range string.
+          compress_ranges() {
+            local out="" start="" prev="" c
+            for c in "$@"; do
+              if [[ -z "${start}" ]]; then
+                start=$c
+                prev=$c
+              elif ((c == prev + 1)); then
+                prev=$c
+              else
+                if ((start == prev)); then out+="${out:+,}${start}"; else out+="${out:+,}${start}-${prev}"; fi
+                start=$c
+                prev=$c
+              fi
+            done
+            if [[ -n "${start}" ]]; then
+              if ((start == prev)); then out+="${out:+,}${start}"; else out+="${out:+,}${start}-${prev}"; fi
+            fi
+            printf '%s' "${out}"
+          }
+          {% endif %}
+
+          {% if deisa_version == "dask" %}
+          DASK_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:0:DASK_CPUS}")
+          ANALYTICS_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:DASK_CPUS}")
+          DASK_WORKER_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:0:DASK_WORKER_CPUS}")
+          {% elif deisa_version == "ray" %}
+          RAY_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:0:RAY_CPUS}")
+          ANALYTICS_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:RAY_CPUS}")
+          RAY_WORKER_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:0:RAY_WORKER_CPUS}")
+          {% endif %}
+
+          # -----------------------------------------------------------------------------
+          # Environment
+          # -----------------------------------------------------------------------------
+          cd "${LOG_DIR}"
+
+          # shellcheck source=/dev/null
+          source "${TOOLCHAIN_ENV}"
+          # shellcheck source=/dev/null
+          source "${VENV_ACTIVATE}"
+
+          unset LUA_PATH LUA_CPATH
+
+          export GYS_DIAG_MODE={{ diag_mode }}
+          export OMP_NUM_THREADS=1
+          export MPICH_GPU_SUPPORT_ENABLED=1
+
+          {% if diag_mode == 1 %}
+          # Ray (imported by deisa.ray) raises
+          #   "Please use HIP_VISIBLE_DEVICES instead of ROCR_VISIBLE_DEVICES"
+          # when ROCR_VISIBLE_DEVICES is set but HIP_VISIBLE_DEVICES is not -- and
+          # Slurm sets ROCR_VISIBLE_DEVICES for the job. The Ray/analytics side is
+          # CPU-only, so hide the GPUs from it. The simulation selects its GCD per
+          # rank via HIP_VISIBLE_DEVICES in the binding script (an IOPS input).
+          unset ROCR_VISIBLE_DEVICES
+          export HIP_VISIBLE_DEVICES=""
+          {% endif %}
+
+          # -----------------------------------------------------------------------------
+          # Node layout
+          # -----------------------------------------------------------------------------
+          mapfile -t NODES < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
+          # NOTE: count nodes with a loop instead of the shell array-length
+          # expansion, whose syntax would start a Jinja comment.
+          NNODES=0
+          for _ in "${NODES[@]}"; do NNODES=$((NNODES + 1)); done
+          {% if deisa_version == "dask" %}
+          SCHEDULER_NODE="${NODES[0]}"
+          {% elif deisa_version == "ray" %}
+          HEAD_NODE="${NODES[0]}"
+          {% endif %}
+          WORKER_NODES=("${NODES[@]:1}")
+          WORKER_NODELIST=""
+          if ((NNODES > 1)); then
+            WORKER_NODELIST=$(
+              IFS=,
+              echo "${WORKER_NODES[*]}"
+            )
+          fi
+
+          echo "Allocated nodes     : ${NODES[*]}"
+          {% if deisa_version == "dask" %}
+          echo "Dask scheduler node : ${SCHEDULER_NODE}"
+          echo "Dask worker nodes   : ${WORKER_NODELIST:-<none>}"
+          echo "CPUs gysela         : ${SIM_ANCHOR_CPUS[*]} (1 per GCD)"
+          echo "CPUs  Dask scheduler (${DASK_CPUS})        : ${DASK_CPU_SET}"
+          echo "CPUs  Dask worker (${DASK_WORKER_CPUS}) : ${DASK_WORKER_CPU_SET}"
+          {% elif deisa_version == "ray" %}
+          echo "Ray head node   : ${HEAD_NODE}"
+          echo "Ray worker nodes: ${WORKER_NODELIST:-<none>}"
+          echo "CPUs  gysela       : ${SIM_ANCHOR_CPUS[*]} (1 per GCD)"
+          echo "CPUs  Ray head (${RAY_CPUS})     : ${RAY_CPU_SET}"
+          echo "CPUs  Ray worker (${RAY_WORKER_CPUS})   : ${RAY_WORKER_CPU_SET}"
+          {% endif %}
+          echo "CPUs  analytics (${ANALYTICS_CPUS}): ${ANALYTICS_CPU_SET}"
+
+          {% if deisa_version == "dask" %}
+          # -----------------------------------------------------------------------------
+          # Dask scheduler on node 0 (also acts as a worker node)
+          # -----------------------------------------------------------------------------
+          export DASK_DISTRIBUTED__CLIENT__HEARTBEAT=7200s
+
+          rm -f {{ schefile }}
+
+          srun -N 1 -n 1 -c 128 -w "${SCHEDULER_NODE}"\
+            --overlap --cpu-bind=none --export=ALL \
+            numactl --localalloc --physcpubind="${DASK_CPU_SET}" \
+            dask scheduler \
+              --scheduler-file={{ schefile }} \
+              --interface hsn0 \
+            >"${LOG_DIR}/scheduler.log" 2>&1 &
+          SCHEDULER_PID=$!
+ 
+          while ! [ -f {{ schefile }} ]; do
+            sleep 1
+            echo -n .
+          done
+ 
+          export DEISA_DASK_SCHEDULER_ADDRESS=$(jq -r '.["address"]' {{ schefile }})
+          {% elif deisa_version == "ray" %}
+          # -----------------------------------------------------------------------------
+          # Ray head on node 0 (also acts as a worker node)
+          # -----------------------------------------------------------------------------
+          HEAD_IP=$(
+            srun -N 1 -n 1 -w "${HEAD_NODE}" --overlap --cpu-bind=none \
+              bash -c "ip -4 -o addr show hsn0 | awk '{print \$4}' | cut -d/ -f1"
+          )
+
+          echo "Launching Ray head on ${HEAD_NODE} (${HEAD_IP}:${RAY_PORT})"
+          srun -N 1 -n 1 -w "${HEAD_NODE}" --overlap --cpu-bind=none --export=ALL \
+            bash -c "
+                  set -eu
+                  unset ROCR_VISIBLE_DEVICES
+                  export HIP_VISIBLE_DEVICES=''
+                  echo '[Ray HEAD] hostname:' \$(hostname)
+                  echo '[Ray HEAD] CPU set : ${RAY_CPU_SET}'
+                  numactl --physcpubind='${RAY_CPU_SET}' \
+                      ray start \
+                          --head \
+                          --node-ip-address='${HEAD_IP}' \
+                          --port=${RAY_PORT} \
+                          --num-cpus=${RAY_CPUS} \
+                          --disable-usage-stats \
+                          --block
+              " >"${LOG_DIR}/ray-head.log" 2>&1 &
+
+          # Wait until the head GCS port accepts connections.
+          echo -n "Waiting for Ray head "
+          for _ in $(seq 1 60); do
+            if (exec 3<>/dev/tcp/"${HEAD_IP}"/"${RAY_PORT}") 2>/dev/null; then
+              exec 3<&- 3>&-
+              break
+            fi
+            echo -n "."
+            sleep 2
+          done
+          echo " ready"
+
+          # deisa-ray locates the head node through the Ray dashboard state API
+          # (http://127.0.0.1:8265), so make sure the dashboard is reachable.
+          echo -n "Waiting for Ray dashboard "
+          dashboard_up=0
+          for _ in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/"${HEAD_IP}"/8265) 2>/dev/null; then
+              exec 3<&- 3>&-
+              dashboard_up=1
+              break
+            fi
+            echo -n "."
+            sleep 2
+          done
+          if ((dashboard_up)); then
+            echo " up (${HEAD_IP}:8265)"
+          else
+            echo " NOT reachable on ${HEAD_IP}:8265"
+            echo "WARNING: deisa-ray needs the Ray dashboard; check ray-head.log and the ray[default] deps." >&2
+          fi
+          {% endif %}
+
+          {% if deisa_version == "dask" %}
+          # -----------------------------------------------------------------------------
+          # Dask workers on all other nodes (the Scheduler node is already a worker)
+          # -----------------------------------------------------------------------------
+          echo "Launching ${NNODES} Dask worker(s) on: ${NODES[*]}"
+          srun -N $((NNODES - 1)) -n $((NNODES - 1)) --ntasks-per-node=1 -c 128 \
+            --overlap --cpu-bind=none --mpi=none --export=ALL \
+            numactl --localalloc --physcpubind="${DASK_WORKER_CPU_SET}" \
+            dask worker --nworkers 1 --nthreads "${DASK_WORKER_CPUS}" \
+              --interface hsn0 --memory-limit {{ worker_memory_gib }}GiB \
+              --local-directory /tmp --scheduler-file={{ schefile }} \
+            >"${LOG_DIR}/dask-worker.log" 2>&1 &
+          WORKER_PID=$!
+          echo -n "Waiting for ${NNODES} Dask workers "
+          joined=0
+          for _ in $(seq 1 60); do
+            joined=$(cat "${LOG_DIR}"/dask-worker*.log 2>/dev/null | grep -c "Registered to:" || true)
+            ((joined >= NNODES)) && break
+            echo -n "."
+            sleep 2
+          done
+          echo " (${joined}/${NNODES})"
+          {% elif deisa_version == "ray" %}
+          # -----------------------------------------------------------------------------
+          # Ray workers on all other nodes (the head node is already a worker)
+          # -----------------------------------------------------------------------------
+          if ((NNODES > 1)); then
+            echo "Launching Ray workers on: ${WORKER_NODELIST}"
+            srun -N $((NNODES - 1)) -n $((NNODES - 1)) --ntasks-per-node=1 \
+              -w "${WORKER_NODELIST}" --overlap --cpu-bind=none --export=ALL \
+              bash -c "
+                      set -eu
+                      unset ROCR_VISIBLE_DEVICES
+                      export HIP_VISIBLE_DEVICES=''
+                      node_ip=\$(ip -o -4 addr show hsn0 | awk '{print \$4}' | cut -d/ -f1)
+                      echo '[Ray WORKER] hostname: '\$(hostname)' ip:' \$node_ip
+                      numactl --physcpubind='${RAY_WORKER_CPU_SET}' \
+                          ray start \
+                              --address='${HEAD_IP}:${RAY_PORT}' \
+                              --node-ip-address=\$node_ip \
+                              --num-cpus=${RAY_WORKER_CPUS} \
+                              --disable-usage-stats \
+                              --block
+                  " >"${LOG_DIR}/ray-worker.log" 2>&1 &
+
+            # Wait (best effort) until all worker nodes have joined the cluster.
+            echo -n "Waiting for ${NNODES} Ray nodes "
+            for _ in $(seq 1 60); do
+              joined=$(ray status --address="${HEAD_IP}:${RAY_PORT}" 2>/dev/null |
+                grep -cE '^[[:space:]]*[0-9]+ node_' || true)
+              if ((joined >= NNODES)); then
+                break
+              fi
+              echo -n "."
+              sleep 2
+            done
+            echo " (${joined:-?}/${NNODES})"
+          fi
+          {% endif %}
+
+          {% if deisa_version == "dask" %}
+          # -----------------------------------------------------------------------------
+          # Cleanup: stop Dask and publish the simulation log for the IOPS parser
+          # -----------------------------------------------------------------------------
+          cleanup() {
+            set +e
+            echo "Stopping Dask..."
+            kill ${WORKER_PID:-} ${SCHEDULER_WORKER_PID:-} ${SCHEDULER_PID:-} 2>/dev/null
+            wait ${WORKER_PID:-} ${SCHEDULER_WORKER_PID:-} ${SCHEDULER_PID:-} 2>/dev/null
+            if [[ -f "${SLURM_BOOT_LOG}" ]]; then
+              mv -f "${SLURM_BOOT_LOG}" "${LOG_DIR}/slurm.log" 2>/dev/null
+            fi
+            if [[ -f "${LOG_DIR}/sim.log" ]]; then
+              cp -f "${LOG_DIR}/sim.log" "{{ gys_compress_output }}" 2>/dev/null
+            fi
+          }
+          trap cleanup EXIT
+          {% elif deisa_version == "ray" %}
+          # -----------------------------------------------------------------------------
+          # Cleanup: stop Ray and publish the simulation log for the IOPS parser
+          # -----------------------------------------------------------------------------
+          cleanup() {
+            echo "Stopping Ray..."
+            ray stop --force >/dev/null 2>&1 || true
+            if ((NNODES > 1)); then
+              srun -N $((NNODES - 1)) -n $((NNODES - 1)) --ntasks-per-node=1 \
+                -w "${WORKER_NODELIST}" --overlap --cpu-bind=none \
+                bash -c 'ray stop --force' >/dev/null 2>&1 || true
+            fi
+            # Safety net: if the bootstrap log was recreated in the submit dir, move it.
+            if [[ -f "${SLURM_BOOT_LOG}" ]]; then
+              mv -f "${SLURM_BOOT_LOG}" "${LOG_DIR}/slurm.log" 2>/dev/null || true
+            fi
+            # Publish the simulation output where the IOPS parser expects it.
+            if [[ -f "${LOG_DIR}/sim.log" ]]; then
+              cp -f "${LOG_DIR}/sim.log" "{{ gys_compress_output }}" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+          {% else %}
+          # -----------------------------------------------------------------------------
+          # Cleanup: publish the simulation log for the IOPS parser
+          # -----------------------------------------------------------------------------
+          cleanup() {
+            set +e
+            if [[ -f "${SLURM_BOOT_LOG}" ]]; then mv -f "${SLURM_BOOT_LOG}" "${LOG_DIR}/slurm.log"; fi
+            if [[ -f "${LOG_DIR}/sim.log" ]]; then cp -f "${LOG_DIR}/sim.log" "{{ gys_compress_output }}"; fi
+          }
+          trap cleanup EXIT
+          {% endif %}
+
+          {% if deisa_version == "dask" %}
+          # -----------------------------------------------------------------------------
+          # Analytics (on the scheduler node; pinned to its reserved CPUs)
+          # -----------------------------------------------------------------------------
+          echo "Launching analytics: ${ANALYTICS_SCRIPT}"
+          numactl --localalloc --physcpubind="${ANALYTICS_CPU_SET}" \
+            python3 "${ANALYTICS_SCRIPT}" \
+            > "${LOG_DIR}/analytics.log" 2>&1 &
+          ANALYTICS_PID=$!
+          {% elif deisa_version == "ray" %}
+          # -----------------------------------------------------------------------------
+          # Analytics (on the head anode; pinned to its reserved CPUs)
+          # -----------------------------------------------------------------------------
+          # Enable deisa-ray's experimental distributed (Dask-on-Ray) scheduling. It
+          # is read by Deisa.__init__ (window_handler); set inline so it is scoped to
+          # the analytics process and not inherited by the simulation step. The
+          # wrapper echoes the value into analytics.log so the effective environment
+          # of the analytics process is verifiable at runtime.
+          echo "Launching analytics: ${ANALYTICS_SCRIPT}"
+          DEISA_DISTRIBUTED_SCHEDULING=1 \
+            bash -c 'echo "[analytics] DEISA_DISTRIBUTED_SCHEDULING=${DEISA_DISTRIBUTED_SCHEDULING}"; exec numactl --physcpubind="$1" python3 "$2"' \
+            _ "${ANALYTICS_CPU_SET}" "${ANALYTICS_SCRIPT}" \
+            >"${LOG_DIR}/analytics.log" 2>&1 &
+          ANALYTICS_PID=$!
+          {% endif %}
+
+          #export KOKKOS_TOOLS_LIBS=libkp_memory_events.so
+          export MPICH_GPU_SUPPORT_ENABLED=1
+          export MPICH_GPU_IPC_ENABLED=0
+ 
+          # -----------------------------------------------------------------------------
+          # Simulation on every node: 8 ranks/node, 1 GCD + 1 CPU per rank
+          # -----------------------------------------------------------------------------
+          SIMU_NODES=${NNODES}
+          SIMU_RANKS=$((SIMU_NODES * RANKS_PER_NODE))
+
+          echo "Launching simu on ${SIMU_NODES} nodes (${RANKS_PER_NODE} ranks/node, ${SIMU_RANKS} ranks total, 1 GCD/rank)"
+          srun -N "${SIMU_NODES}" -n "${SIMU_RANKS}" --ntasks-per-node="${RANKS_PER_NODE}" \
+            --cpu-bind=none --mem-bind=none -c 16 --gpus-per-node=8 --overlap -r 0 \
+            "${GPU_BINDING}" \
+            "${GYS_COMPRESS_BIN}" "${GYS_CONF}" "${PDI_CONFIG}" \
+            >"${LOG_DIR}/sim.log" 2>&1 &
+          SIM_PID=$!
+ 
+          {% if diag_mode == 1 %}
+          # -----------------------------------------------------------------------------
+          # Wait
+          # -----------------------------------------------------------------------------
+          ANALYTICS_RC=0
+          SIM_RC=0
+          if ((GYS_DIAG_MODE == 1)); then
+            wait "${ANALYTICS_PID}" || ANALYTICS_RC=$?
+            echo "Analytics over (rc=${ANALYTICS_RC})"
+          fi
+          wait "${SIM_PID}" || SIM_RC=$?
+          echo "Simulation over (rc=${SIM_RC})"
+
+          if ((ANALYTICS_RC != 0 || SIM_RC != 0)); then
+            echo "ERROR: analytics rc=${ANALYTICS_RC}, simulation rc=${SIM_RC}" >&2
+            exit 1
+          fi
+          {% elif diag_mode == 2 %}
+          SIM_RC=0
+          wait "${SIM_PID}" || SIM_RC=$?
+          echo "Simulation over (rc=${SIM_RC})"
+
+          # -----------------------------------------------------------------------------
+          # Post-hoc diagnostics
+          # -----------------------------------------------------------------------------
+          python3 $BASE_DIR/src/python/finalize_reduced_diagnostics.py \
+            {{ execution_dir }}
+
+          ((SIM_RC == 0)) || exit "${SIM_RC}"
+          {% else %}
+          SIM_RC=0
+          wait "${SIM_PID}" || SIM_RC=$?
+          echo "Simulation over (rc=${SIM_RC})"
+          ((SIM_RC == 0)) || exit "${SIM_RC}"
+          {% endif %}
