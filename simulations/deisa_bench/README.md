@@ -16,6 +16,7 @@
 | `../../processing/moments.py` | Fluid moments of `fdistribu`. |
 | `../../processing/finite_differences.py` | Fifth-order finite-difference weights in time. |
 | `../../processing/hyperblock.py` | Position of the hyperblock and of each rank's piece of it. |
+| `../../processing/per_node_hdf5.py` | Per-node HDF5 output of the checkpoints. |
 | `../../benchmark/iops_isav.yaml` | IOPS benchmark campaign. |
 
 ## Configuration
@@ -36,8 +37,9 @@ With `params/pdi_out_diags.yaml`, the analytics (`processing/diagnostics.py`) wr
 | --- | --- | --- |
 | `fluid_moments/fluid_moments_iter<iter>.h5` | every `nbiter_diag` | Fluid moments `n`, `ux`, `uy`, `T`, each of shape `(species, x, y)`, with the `x`/`y` mesh coordinates. |
 | `hyperblock_dfdt/dfdistribu_dt_iter<iter>.h5` | every `nbiter_diag`, except the first 3 and last 2 diagnostic steps | Time derivative of the hyperblock, `dfdistribu_dt[x, y, vx, vy]`, with its mesh coordinates: one shared file per step. |
+| `checkpoint/fdistribu_iter<iter>_<host>.h5` | whenever the previous checkpoint has been written | The whole `fdistribu`, one file per Dask node, one group per MPI rank's chunk with its mesh coordinates and global start indices. |
 
-Both are written with xarray and read back with `xr.open_dataset(path)`.
+All are written with xarray and read back with `xr.open_dataset(path)` (`group=...` for the per-node checkpoint files).
 
 ### Fluid moments
 
@@ -54,6 +56,15 @@ The hyperblock is a 4D `(x, y, vx, vy)` block of `fdistribu`, around the middle 
 At every diagnostic step, the ranks holding a part of the hyperblock send it (`fdistribu_hyperblock`), and deisa assembles it. The `write_hyperblock_derivative` callback keeps the last 6 hyperblocks in a deisa window (`Window("fdistribu_hyperblock", 6)`). Once the window is full, it computes the time derivative at its 4th step, i.e. 2 diagnostic steps back, as a dask array, and writes it with `xr.Dataset(...).to_netcdf(...)`.
 
 The time derivative is a fifth-order finite difference over the 6 steps from 3 before to 2 after the step (`processing/finite_differences.py`). It is only computed where these steps exist, so the first 3 and the last 2 diagnostic steps of the run have no derivative file. The weights follow the actual step times, so an uneven last step is handled. The file attributes `derivative_iters` and `derivative_order` record the stencil.
+
+### Checkpoint
+
+The whole `fdistribu` is checkpointed asynchronously, as often as the writes allow. At every diagnostic step the pycall checks the PDI variable `checkpoint_write_pending`:
+
+- `1`: the last checkpoint is still being written. The pycall asks deisa for the write acknowledgement (`checkpoint_write_done`) and clears the flag once it has arrived.
+- `0`: the pycall sends `checkpoint_trigger` along with that step's `fdistribu`, then sets the flag to `1`. The `write_checkpoint` callback only fires on that trigger: it writes that step's `fdistribu` and acknowledges with `deisa.set`.
+
+Checkpoints therefore run back to back without blocking the simulation, at diagnostic steps, reusing the `fdistribu` already shared for the fluid moments. The first one is the initial state.
 
 ### Mergeable PCA
 

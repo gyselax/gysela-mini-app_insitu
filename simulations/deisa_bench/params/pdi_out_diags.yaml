@@ -11,6 +11,8 @@ metadata:
   deltat: double
   nbstep_diag: int
   nbstep_pca: int
+  # 1 while the last fdistribu checkpoint is being written, 0 once it has finished
+  checkpoint_write_pending: int
   MeshX_extents: { type: array, subtype: int64, size: 1 }
   MeshX:
     type: array
@@ -77,24 +79,44 @@ plugins:
         exec: |
           import time
           import numpy as np
+          import pdi
           from mpi4py import MPI
           from deisa.dask import Bridge
           from processing.hyperblock import hyperblock_piece
           comm = MPI.COMM_WORLD
           rank = comm.Get_rank()
+          CHECKPOINT_WRITE_DONE = "checkpoint_write_done"
 
           if rank == 0:
             pycall_time = 0.0
 
-          def share_with_analytics(fdistribu, timestep, deltat, meshes):
-            """Send one diagnostic step to deisa."""
+          def share_with_analytics(fdistribu, timestep, deltat, write_pending, meshes):
+            """Send one diagnostic step to deisa and update checkpoint_write_pending."""
+            global checkpoint_iter
+            # Bridge.get is collective (all ranks call it) and does not block: it raises
+            # KeyError until a first checkpoint has been acknowledged, then returns None
+            # until the one launched at checkpoint_iter is.
+            if write_pending:
+              try:
+                if bridge.get(CHECKPOINT_WRITE_DONE, timestep=checkpoint_iter):
+                  write_pending = 0
+              except KeyError:
+                pass
+
             bridge.send("fdistribu", fdistribu, timestep)
             if hyperblock_layout is not None:
               bridge.send("fdistribu_hyperblock", np.ascontiguousarray(fdistribu[hyperblock_selection]), timestep)
             if rank == 0:
+              if not write_pending:
+                bridge.send("checkpoint_trigger", np.array([1], dtype=np.int64), timestep)
               bridge.send("deltat", np.array([float(deltat)]), timestep)
               for name, mesh in meshes.items():
                 bridge.send(name, np.array(mesh), timestep)
+
+            if not write_pending:
+              write_pending = 1
+              checkpoint_iter = timestep
+            pdi.expose("checkpoint_write_pending", np.array(write_pending, dtype=np.intc), pdi.OUT)
       InitBridge:
         with: { global_fdistribu_extents: $global_fdistribu_extents,
                 local_fdistribu_extents: $local_fdistribu_extents,
@@ -128,12 +150,14 @@ plugins:
 
           # Arrays sent by rank 0 only
           if rank == 0:
-            for name, size in (("deltat", 1),
+            for name, size in (("deltat", 1), ("checkpoint_trigger", 1),
                                ("MeshX", MeshX_extents[0]), ("MeshY", MeshY_extents[0]),
                                ("MeshVx", MeshVx_extents[0]), ("MeshVy", MeshVy_extents[0])):
               arrays_metadata[name] = {"global_shape": (int(size),), "chunk_shape": (int(size),), "chunk_position": (0,)}
 
           bridge = Bridge(comm, arrays_metadata)
+          checkpoint_iter = None
+          pdi.expose("checkpoint_write_pending", np.array(0, dtype=np.intc), pdi.OUT)
 
           if rank == 0:
             pycall_time += time.time() - t0
@@ -146,6 +170,7 @@ plugins:
           iter_offset: $iter_offset
           nbstep_diag: $nbstep_diag
           nbstep_pca: $nbstep_pca
+          write_pending: $checkpoint_write_pending
           MeshX: $MeshX
           MeshY: $MeshY
           MeshVx: $MeshVx
@@ -157,7 +182,7 @@ plugins:
 
           timestep = int(it) + int(iter_offset)
           if timestep % int(nbstep_diag) == 0:
-            share_with_analytics(fdistribu, timestep, deltat,
+            share_with_analytics(fdistribu, timestep, deltat, write_pending,
                                  {"MeshX": MeshX, "MeshY": MeshY, "MeshVx": MeshVx, "MeshVy": MeshVy})
           if int(nbstep_pca) > 0 and timestep > 0 and timestep % int(nbstep_pca) == 0:
             bridge.send("fdistribu_pca", fdistribu, timestep)
@@ -173,6 +198,7 @@ plugins:
           deltat: $deltat
           iter_offset: $iter_offset
           nbstep_pca: $nbstep_pca
+          write_pending: $checkpoint_write_pending
           MeshX: $MeshX
           MeshY: $MeshY
           MeshVx: $MeshVx
@@ -182,7 +208,7 @@ plugins:
             t0 = time.time()
 
           timestep = int(it) + int(iter_offset)
-          share_with_analytics(fdistribu, timestep, deltat,
+          share_with_analytics(fdistribu, timestep, deltat, write_pending,
                                {"MeshX": MeshX, "MeshY": MeshY, "MeshVx": MeshVx, "MeshVy": MeshVy})
           if int(nbstep_pca) > 0 and timestep > 0 and timestep % int(nbstep_pca) == 0:
             bridge.send("fdistribu_pca", fdistribu, timestep)

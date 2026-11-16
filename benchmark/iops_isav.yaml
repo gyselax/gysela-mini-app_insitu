@@ -190,6 +190,8 @@ scripts:
           type: float
         - name: time_hyperblock
           type: float
+        - name: time_checkpoint
+          type: float
         - name: time_total
           type: float
       parser_script: |
@@ -216,6 +218,7 @@ scripts:
             time_pca = None
             time_diagnostics = None
             time_hyperblock = None
+            time_checkpoint = None
             time_total = None
             for line in lines:
               if "Time pycall:" in line:
@@ -234,6 +237,8 @@ scripts:
                 time_diagnostics = float(line.split("Time diagnostics:")[1].strip().rstrip('s'))
               elif "Time hyperblock:" in line:
                 time_hyperblock = float(line.split("Time hyperblock:")[1].strip().rstrip('s'))
+              elif "Time checkpoint:" in line:
+                time_checkpoint = float(line.split("Time checkpoint:")[1].strip().rstrip('s'))
               elif "Time total:" in line:
                 time_total = float(line.split("Time total:")[1].strip().rstrip('s'))
 
@@ -246,6 +251,7 @@ scripts:
               "time_pca": time_pca,
               "time_diagnostics": time_diagnostics,
               "time_hyperblock": time_hyperblock,
+              "time_checkpoint": time_checkpoint,
               "time_total": time_total,
             }
 

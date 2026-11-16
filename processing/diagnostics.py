@@ -4,6 +4,8 @@
   - fluid moments of fdistribu (n, ux, uy, T), written to fluid_moments/fluid_moments_iter<iter>.h5;
   - fifth-order time derivative of the fdistribu hyperblock, wherever its stencil is
     available, written to hyperblock_dfdt/dfdistribu_dt_iter<iter>.h5.
+- Whenever the previous checkpoint has been written: checkpoint of fdistribu, written to
+  checkpoint/fdistribu_iter<iter>_<host>.h5 with one file per node.
 - Every Output.nbiter_pca iterations: mergeable PCA of fdistribu.
 
 What the simulation shares and when is set in simulations/deisa_bench/params/pdi_out_diags.yaml.
@@ -11,6 +13,7 @@ What the simulation shares and when is set in simulations/deisa_bench/params/pdi
 
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -23,14 +26,18 @@ from distributed.diagnostics import MemorySampler
 from processing.finite_differences import FD_POINTS, FD_TARGET_INDEX, derivative_weights
 from processing.hyperblock import HYPERBLOCK_SPECIES, hyperblock_slices
 from processing.moments import fluid_moments
+from processing.per_node_hdf5 import write_per_node
+
+CHECKPOINT_WRITE_DONE = "checkpoint_write_done"
 
 # Absolute paths, as the Dask workers write into these files too
 FLUID_MOMENTS_DIR = Path("fluid_moments").resolve()
 HYPERBLOCK_DIR = Path("hyperblock_dfdt").resolve()
-for directory in (FLUID_MOMENTS_DIR, HYPERBLOCK_DIR):
+CHECKPOINT_DIR = Path("checkpoint").resolve()
+for directory in (FLUID_MOMENTS_DIR, HYPERBLOCK_DIR, CHECKPOINT_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
-timers = {"diagnostics": 0.0, "hyperblock": 0.0, "pca": 0.0}
+timers = {"diagnostics": 0.0, "hyperblock": 0.0, "checkpoint": 0.0, "pca": 0.0}
 _TIMERS_LOCK = threading.Lock()
 
 
@@ -96,6 +103,33 @@ def write_hyperblock_derivative(fdistribu_hyperblock, fdistribu, deltat, MeshX, 
     _add_time("hyperblock", t0)
 
 
+@deisa.register("fdistribu", "checkpoint_trigger", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy")
+def write_checkpoint(fdistribu, checkpoint_trigger, deltat, MeshX, MeshY, MeshVx, MeshVy):
+    """Write fdistribu with one file per node, then acknowledge the write.
+
+    Fires at the diagnostic steps where the simulation sends checkpoint_trigger, i.e.
+    as soon as the previous checkpoint has been written. The acknowledgement is sent
+    even if the write fails, so that the simulation keeps launching checkpoints.
+    """
+    t0 = time.time()
+    iteration = int(fdistribu[-1].t)
+    try:
+        write_per_node(
+            deisa.client,
+            fdistribu[-1],
+            {"x": MeshX[-1], "y": MeshY[-1], "vx": MeshVx[-1], "vy": MeshVy[-1]},
+            CHECKPOINT_DIR,
+            prefix=f"fdistribu_iter{iteration:05d}",
+            attrs={"iter": iteration, "time": iteration * float(deltat[-1][0])},
+        )
+    except Exception:
+        print(f"Checkpoint of iter {iteration} failed:", flush=True)
+        traceback.print_exc()
+    finally:
+        deisa.set(CHECKPOINT_WRITE_DONE, 1, iteration)
+        _add_time("checkpoint", t0)
+
+
 @deisa.register("fdistribu_pca")
 def compute_mergeable_pca(fdistribu_pca):
     """Mergeable PCA of fdistribu, every Output.nbiter_pca iterations.
@@ -127,6 +161,7 @@ with (
     print("Time analytics:", time.time() - t0, flush=True)
     print("Time diagnostics:", timers["diagnostics"], flush=True)
     print("Time hyperblock:", timers["hyperblock"], flush=True)
+    print("Time checkpoint:", timers["checkpoint"], flush=True)
     print("Time pca:", timers["pca"], flush=True)
 
 plots = {
