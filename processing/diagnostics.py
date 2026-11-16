@@ -53,7 +53,7 @@ def _add_time(name, t0):
 deisa = Deisa()
 
 
-@deisa.register("fdistribu", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy")
+@deisa.register("fdistribu", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy", precompute=False)
 def compute_fluid_moments(fdistribu, deltat, MeshX, MeshY, MeshVx, MeshVy):
     """Fluid moments of fdistribu at this diagnostic step."""
     t0 = time.time()
@@ -69,7 +69,7 @@ def compute_fluid_moments(fdistribu, deltat, MeshX, MeshY, MeshVx, MeshVy):
 
 
 @deisa.register(Window("fdistribu_hyperblock", FD_POINTS), "fdistribu", "deltat",
-                "MeshX", "MeshY", "MeshVx", "MeshVy")
+                "MeshX", "MeshY", "MeshVx", "MeshVy", precompute=False)
 def write_hyperblock_derivative(fdistribu_hyperblock, fdistribu, deltat, MeshX, MeshY, MeshVx, MeshVy):
     """Fifth-order time derivative of the hyperblock, wherever its stencil is available.
 
@@ -103,7 +103,7 @@ def write_hyperblock_derivative(fdistribu_hyperblock, fdistribu, deltat, MeshX, 
     _add_time("hyperblock", t0)
 
 
-@deisa.register("fdistribu", "checkpoint_trigger", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy")
+@deisa.register("fdistribu", "checkpoint_trigger", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy", precompute=False)
 def write_checkpoint(fdistribu, checkpoint_trigger, deltat, MeshX, MeshY, MeshVx, MeshVy):
     """Write fdistribu with one file per node, then acknowledge the write.
 
@@ -130,7 +130,7 @@ def write_checkpoint(fdistribu, checkpoint_trigger, deltat, MeshX, MeshY, MeshVx
         _add_time("checkpoint", t0)
 
 
-@deisa.register("fdistribu_pca")
+@deisa.register("fdistribu_pca", precompute=False)
 def compute_mergeable_pca(fdistribu_pca):
     """Mergeable PCA of fdistribu, every Output.nbiter_pca iterations.
 
