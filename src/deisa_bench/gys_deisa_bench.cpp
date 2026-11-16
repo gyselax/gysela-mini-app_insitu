@@ -299,6 +299,13 @@ int main(int argc, char **argv) {
     iter_offset =
         static_cast<int>(PCpp_int(configs.conf_gyselax, ".Input.iter_offset"));
   }
+  // Period of the in-situ PCA, 0 disables it
+  int nbstep_pca = 0;
+  if (!PC_status(PC_get(configs.conf_gyselax, ".Output.nbiter_pca"))) {
+    nbstep_pca =
+        static_cast<int>(PCpp_int(configs.conf_gyselax, ".Output.nbiter_pca"));
+  }
+
   if (rank == 0) {
     std::cout << "Input fdistribu file name: " << fdistribu_filename
               << std::endl;
@@ -399,6 +406,7 @@ int main(int argc, char **argv) {
   expose_mesh_to_pdi("MeshVx", idxrange_vx);
   expose_mesh_to_pdi("MeshVy", idxrange_vy);
   ddc::expose_to_pdi("nbstep_diag", nbstep_diag);
+  ddc::expose_to_pdi("nbstep_pca", nbstep_pca);
   ddc::expose_to_pdi("deltat", deltat);
   ddc::expose_to_pdi("Nkinspecies", idx_range_kinsp.size());
   ddc::expose_to_pdi("fdistribu_charges",

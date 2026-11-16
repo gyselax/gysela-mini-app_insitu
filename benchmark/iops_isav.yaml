@@ -110,6 +110,12 @@ vars:
       mode: list
       values: [50]
 
+  nbiter_pca:
+    type: int
+    sweep:
+      mode: list
+      values: [26]
+
   nbiter_diag:
     type: int
     sweep:
@@ -159,7 +165,8 @@ scripts:
             nbiter: {{ nbiter }}
 
           Output:
-            nbiter_diag: {{ nbiter_diag }}  # diagnostics every N timesteps
+            nbiter_diag: {{ nbiter_diag }}  # in-situ diagnostics every N timesteps
+            nbiter_pca: {{ nbiter_pca }}  # mergeable PCA every N timesteps, 0 disables it
 
     script_template: |
       mpirun {{ command.template }} >> {{ gys_deisa_bench_output }} >&1
@@ -177,9 +184,11 @@ scripts:
           type: float
         - name: time_analytics
           type: float
+        - name: time_pca
+          type: float
         - name: time_diagnostics
           type: float
-        - name: time_write
+        - name: time_hyperblock
           type: float
         - name: time_total
           type: float
@@ -204,8 +213,9 @@ scripts:
             time_bridge_init = None
             time_full_simulation = None
             time_analytics = None
+            time_pca = None
             time_diagnostics = None
-            time_write = None
+            time_hyperblock = None
             time_total = None
             for line in lines:
               if "Time pycall:" in line:
@@ -218,10 +228,12 @@ scripts:
                 time_full_simulation = float(line.split("Time full simulation:")[1].strip().rstrip('s'))
               elif "Time analytics:" in line:
                 time_analytics = float(line.split("Time analytics:")[1].strip().rstrip('s'))
+              elif "Time pca:" in line:
+                time_pca = float(line.split("Time pca:")[1].strip().rstrip('s'))
               elif "Time diagnostics:" in line:
                 time_diagnostics = float(line.split("Time diagnostics:")[1].strip().rstrip('s'))
-              elif "Time write:" in line:
-                time_write = float(line.split("Time write:")[1].strip().rstrip('s'))
+              elif "Time hyperblock:" in line:
+                time_hyperblock = float(line.split("Time hyperblock:")[1].strip().rstrip('s'))
               elif "Time total:" in line:
                 time_total = float(line.split("Time total:")[1].strip().rstrip('s'))
 
@@ -231,8 +243,9 @@ scripts:
               "time_bridge_init": time_bridge_init,
               "time_full_simulation": time_full_simulation,
               "time_analytics": time_analytics,
+              "time_pca": time_pca,
               "time_diagnostics": time_diagnostics,
-              "time_write": time_write,
+              "time_hyperblock": time_hyperblock,
               "time_total": time_total,
             }
 

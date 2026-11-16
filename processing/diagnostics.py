@@ -1,192 +1,42 @@
-"""In-situ diagnostics: conserved-variable calculations and deisa analytics callback."""
+"""In-situ analytics (deisa) for gys_deisa_bench, launched next to the simulation.
 
+- Every Output.nbiter_diag iterations:
+  - fluid moments of fdistribu (n, ux, uy, T), written to fluid_moments/fluid_moments_iter<iter>.h5;
+  - fifth-order time derivative of the fdistribu hyperblock, wherever its stencil is
+    available, written to hyperblock_dfdt/dfdistribu_dt_iter<iter>.h5.
+- Every Output.nbiter_pca iterations: mergeable PCA of fdistribu.
+
+What the simulation shares and when is set in simulations/deisa_bench/params/pdi_out_diags.yaml.
+"""
+
+import threading
 import time
-import csv
-from dataclasses import dataclass, field
 from pathlib import Path
 
-import dask.array as da
-import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import xarray as xr
+from deisa.core import Window
 from deisa.dask import Deisa
 from distributed.diagnostics import MemorySampler
 
-import pandas as pd
-import matplotlib.pyplot as plt
+from processing.finite_differences import FD_POINTS, FD_TARGET_INDEX, derivative_weights
+from processing.hyperblock import HYPERBLOCK_SPECIES, hyperblock_slices
+from processing.moments import fluid_moments
 
-_MEASURE_CFG = None
+# Absolute paths, as the Dask workers write into these files too
+FLUID_MOMENTS_DIR = Path("fluid_moments").resolve()
+HYPERBLOCK_DIR = Path("hyperblock_dfdt").resolve()
+for directory in (FLUID_MOMENTS_DIR, HYPERBLOCK_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
 
-@dataclass
-class PathsConfig:
-    data_dir: Path
-
-
-@dataclass
-class GridConfig:
-    """Uniform 2D2V mesh (x, y, vx, vy) with precomputed wavenumbers."""
-
-    x:  object
-    y:  object
-    vx: object
-    vy: object
-    kx: object = field(init=False)
-    ky: object = field(init=False)
-
-    def __post_init__(self):
-        Nx = da.asarray(self.x).size
-        Ny = da.asarray(self.y).size
-        self.kx = 2.0 * da.pi * da.fft.fftfreq(Nx, d=self.dx)
-        self.ky = 2.0 * da.pi * da.fft.fftfreq(Ny, d=self.dy)
-
-    @staticmethod
-    def spacing(coord):
-        values = da.asarray(coord)
-        if values.size < 2:
-            raise ValueError(
-                "Young Padawan, a single point doth not a grid make. "
-                "The Force requires at least two points."
-            )
-        return float(values[1] - values[0])
-
-    @property
-    def dx(self):
-        return self.spacing(self.x)
-
-    @property
-    def dy(self):
-        return self.spacing(self.y)
-
-    @property
-    def dvx(self):
-        return self.spacing(self.vx)
-
-    @property
-    def dvy(self):
-        return self.spacing(self.vy)
-
-    @property
-    def dV_2D(self):
-        return self.dx * self.dy
-
-    @property
-    def dV_4D(self):
-        return self.dx * self.dy * self.dvx * self.dvy
+timers = {"diagnostics": 0.0, "hyperblock": 0.0, "pca": 0.0}
+_TIMERS_LOCK = threading.Lock()
 
 
-@dataclass
-class Config:
-    paths: PathsConfig
-    grid:  GridConfig
-
-
-def init_measure_config(x, y, vx, vy, data_dir="."):
-    global _MEASURE_CFG
-    _MEASURE_CFG = Config(PathsConfig(Path(data_dir)), GridConfig(x, y, vx, vy))
-    return _MEASURE_CFG
-
-
-def get_measure_config():
-    if _MEASURE_CFG is None:
-        raise RuntimeError(
-            "Padawan, you have not yet trained your config. "
-            "Call init_measure_config first, you must."
-        )
-    return _MEASURE_CFG
-
-
-def density(fdistribu, grid):
-    """Integrate f over all species and velocity dimensions -> n(x, y)."""
-    return da.sum(fdistribu, axis=(0, 3, 4)) * grid.dvx * grid.dvy
-
-
-def poisson_fft(n, grid):
-    """Solve Laplacian(phi) = -(n - 1) on a doubly-periodic domain using da.fft.fft2.
-
-    In Fourier space: -(kx^2 + ky^2) * phi_hat(k) = rho_hat(k)
-    phi_hat(0,0) = 0  (gauge condition)
-    """
-    # fft2 needs a single chunk along the transformed axes
-    rho_hat = da.fft.fft2((n - 1.0).rechunk(-1))
-
-    KX, KY = da.meshgrid(grid.kx, grid.ky, indexing="ij")
-    k2 = KX ** 2 + KY ** 2
-    k2[0, 0] = 1.0              # avoid /0; DC mode zeroed by mask below
-
-    mask = da.ones_like(k2)
-    mask[0, 0] = 0.0            # gauge: phi_hat(0,0) = 0
-
-    phi_hat = rho_hat / k2 * mask
-    return da.real(da.fft.ifft2(phi_hat))
-
-
-def electric_field_from_potential(phi, grid):
-    """Compute E = -nabla(phi) via spectral differentiation using da.fft.fft2.
-
-    In Fourier space:
-      E_hat_x(k) = -1j * kx * phi_hat(k)
-      E_hat_y(k) = -1j * ky * phi_hat(k)
-    Returns array of shape (Nx, Ny, 2).
-    """
-    phi_hat = da.fft.fft2(phi.rechunk(-1))
-    KX, KY = da.meshgrid(grid.kx, grid.ky, indexing="ij")
-    Ex = da.real(da.fft.ifft2(-1j * KX * phi_hat))
-    Ey = da.real(da.fft.ifft2(-1j * KY * phi_hat))
-    return da.stack([Ex, Ey], axis=-1)
-
-
-def electric_field_energy(Efield, grid):
-    return 0.5 * da.sum(Efield ** 2) * grid.dV_2D
-
-_INITIALIZED_DIAG_FILES = set()
-
-def measure(cfg, f, Efield, it, t_actual):
-    """Compute and append conserved-variable diagnostics for a 4D f[x, y, vx, vy]."""
-    data_dir = cfg.paths.data_dir
-    data_dir.mkdir(parents=True, exist_ok=True)
-    diag_file_path = data_dir / "diagnostics.csv"
-
-    if f.ndim != 4:
-        raise ValueError(
-            f"Padawan, the electric force is not with you -- "
-            f"f must have 4 dimensions, not {f.ndim}."
-        )
-
-    grid  = cfg.grid
-    vx_bc = grid.vx[(None, None, slice(None), None)]
-    vy_bc = grid.vy[(None, None, None, slice(None))]
-    v2    = vx_bc ** 2 + vy_bc ** 2
-
-    epot       = electric_field_energy(Efield, grid)
-    ekin       = 0.5 * da.sum(f * v2) * grid.dV_4D
-    l2norm_sq  = da.sum(f ** 2) * grid.dV_4D
-    mass       = da.sum(f) * grid.dV_4D
-    momentum_x = da.sum(f * vx_bc) * grid.dV_4D
-    momentum_y = da.sum(f * vy_bc) * grid.dV_4D
-
-    epot, ekin, l2norm_sq, mass, momentum_x, momentum_y = map(
-        float, da.compute(epot, ekin, l2norm_sq, mass, momentum_x, momentum_y)
-    )
-
-    data = {
-        "iter":       it,
-        "time":       float(t_actual),
-        "ekin":       ekin,
-        "epot":       epot,
-        "etot":       ekin + epot,
-        "l2norm":     float(np.sqrt(l2norm_sq)),
-        "mass":       mass,
-        "momentum":   float(np.hypot(momentum_x, momentum_y)),
-        "momentum_x": momentum_x,
-        "momentum_y": momentum_y,
-    }
-
-    reset = diag_file_path not in _INITIALIZED_DIAG_FILES
-    _INITIALIZED_DIAG_FILES.add(diag_file_path)
-    write_header = reset or not diag_file_path.is_file()
-    with open(diag_file_path, mode="w" if reset else "a", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=data.keys())
-        if write_header:
-            writer.writeheader()
-        writer.writerow(data)
+def _add_time(name, t0):
+    with _TIMERS_LOCK:
+        timers[name] += time.time() - t0
 
 
 # ---------------------------------------------------------------------------
@@ -195,37 +45,70 @@ def measure(cfg, f, Efield, it, t_actual):
 
 deisa = Deisa()
 
-diagnostics_time = 0.0
 
-
-@deisa.register("fdistribu", "absolute_time", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy")
-def compute_diagnostics(fdistribu, absolute_time, deltat, MeshX, MeshY, MeshVx, MeshVy):
-    global diagnostics_time
+@deisa.register("fdistribu", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy")
+def compute_fluid_moments(fdistribu, deltat, MeshX, MeshY, MeshVx, MeshVy):
+    """Fluid moments of fdistribu at this diagnostic step."""
     t0 = time.time()
+    iteration = int(fdistribu[-1].t)
+    moments = fluid_moments(fdistribu[-1], MeshVx[-1], MeshVy[-1])
+    dataset = xr.Dataset(
+        {name: (("species", "x", "y"), field) for name, field in moments.items()},
+        coords={"species": range(fdistribu[-1].shape[0]), "x": MeshX[-1], "y": MeshY[-1]},
+        attrs={"iter": iteration, "time": iteration * float(deltat[-1][0])},
+    )
+    dataset.to_netcdf(FLUID_MOMENTS_DIR / f"fluid_moments_iter{iteration:05d}.h5", engine="h5netcdf")
+    _add_time("diagnostics", t0)
 
-    if _MEASURE_CFG is None:
-        x, y, vx, vy = da.compute(MeshX[-1], MeshY[-1], MeshVx[-1], MeshVy[-1])
-        init_measure_config(x=x, y=y, vx=vx, vy=vy)
 
-    # The time is rebuilt from the iteration of fdistribu: absolute_time may already
-    # hold a later iteration when the simulation runs ahead of the analytics.
-    timestep = int(fdistribu[-1].t)
-    (deltat_value,) = da.compute(deltat[-1][0])
-    t_actual = timestep * float(deltat_value)
+@deisa.register(Window("fdistribu_hyperblock", FD_POINTS), "fdistribu", "deltat",
+                "MeshX", "MeshY", "MeshVx", "MeshVy")
+def write_hyperblock_derivative(fdistribu_hyperblock, fdistribu, deltat, MeshX, MeshY, MeshVx, MeshVy):
+    """Fifth-order time derivative of the hyperblock, wherever its stencil is available.
 
-    cfg = get_measure_config()
+    The window holds the 4D (x, y, vx, vy) hyperblock of the last FD_POINTS diagnostic
+    steps. Once it is full, the derivative is taken at its step FD_TARGET_INDEX, from the
+    steps 3 before to 2 after it, and written to hyperblock_dfdt/dfdistribu_dt_iter<iter>.h5
+    with the mesh coordinates of the hyperblock. The first 3 and last 2 diagnostic steps
+    of the run have no derivative.
+    """
+    if len(fdistribu_hyperblock) < FD_POINTS:
+        return
+    t0 = time.time()
+    iters = [int(block.t) for block in fdistribu_hyperblock]
+    target = iters[FD_TARGET_INDEX]
+    dt = float(deltat[-1][0])
+    weights = derivative_weights([it * dt for it in iters], target * dt)
+    dfdt = sum(w * block for w, block in zip(weights, fdistribu_hyperblock))
+    x, y, vx, vy = hyperblock_slices(fdistribu[-1].shape, fdistribu[-1].chunksize)
+    dataset = xr.Dataset(
+        {"dfdistribu_dt": (("x", "y", "vx", "vy"), dfdt)},
+        coords={"x": MeshX[-1][x], "y": MeshY[-1][y], "vx": MeshVx[-1][vx], "vy": MeshVy[-1][vy]},
+        attrs={
+            "iter": target,
+            "time": target * dt,
+            "species": HYPERBLOCK_SPECIES,
+            "derivative_iters": iters,
+            "derivative_order": FD_POINTS - 1,
+        },
+    )
+    dataset.to_netcdf(HYPERBLOCK_DIR / f"dfdistribu_dt_iter{target:05d}.h5", engine="h5netcdf")
+    _add_time("hyperblock", t0)
 
-    n      = density(fdistribu[-1], cfg.grid)
-    phi    = poisson_fft(n, cfg.grid)
-    Efield = electric_field_from_potential(phi, cfg.grid)
 
-    Nsp = fdistribu[-1].shape[0]
-    for isp in range(Nsp):
-        data_dir = cfg.paths.data_dir if Nsp == 1 else cfg.paths.data_dir / f"species_{isp}"
-        sp_cfg = Config(paths=PathsConfig(data_dir), grid=cfg.grid)
-        measure(sp_cfg, fdistribu[-1][isp], Efield, timestep, t_actual)
+@deisa.register("fdistribu_pca")
+def compute_mergeable_pca(fdistribu_pca):
+    """Mergeable PCA of fdistribu, every Output.nbiter_pca iterations.
 
-    diagnostics_time += time.time() - t0
+    Placeholder for the mergeable PCA of the upcoming deisa-dask release.
+    """
+    t0 = time.time()
+    iteration = int(fdistribu_pca[-1].t)
+
+    # TODO: mergeable PCA of fdistribu_pca[-1] with the new deisa-dask API.
+    print(f"Mergeable PCA placeholder reached for iter {iteration}", flush=True)
+
+    _add_time("pca", t0)
 
 
 samplers = {
@@ -238,12 +121,14 @@ with (
     samplers["spilled_memory"].sample("spilled_memory", measure="spilled"),
 ):
     t0 = time.time()
-    
+
     deisa.execute_callbacks()
 
     print("Time analytics:", time.time() - t0, flush=True)
-    print("Time diagnostics:", diagnostics_time, flush=True)
-# Save plots
+    print("Time diagnostics:", timers["diagnostics"], flush=True)
+    print("Time hyperblock:", timers["hyperblock"], flush=True)
+    print("Time pca:", timers["pca"], flush=True)
+
 plots = {
     "all_callbacks": "mem_consumption_analytics.png",
     "spilled_memory": "spilled_mem_analytics.png",
@@ -253,7 +138,6 @@ for name, filename in plots.items():
     plt.savefig(filename)
     plt.clf()
 
-# Save raw samples
 csv_files = {
     "all_callbacks": "memory_samples.csv",
     "spilled_memory": "memory_spilled_samples.csv",
@@ -264,21 +148,3 @@ for name, filename in csv_files.items():
         columns=["time", "memory"],
     )
     df.to_csv(filename, index=False)
-
-
-def _sort_diagnostics_files():
-    """Rewrite each diagnostics.csv sorted by iter (rows are appended in
-    task-completion order, which is not guaranteed to be time order)."""
-    for path in _INITIALIZED_DIAG_FILES:
-        with open(path, newline="") as fh:
-            reader = csv.DictReader(fh)
-            fieldnames = reader.fieldnames
-            rows = sorted(reader, key=lambda r: int(r["iter"]))
-        with open(path, "w", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-
-
-_sort_diagnostics_files()
-

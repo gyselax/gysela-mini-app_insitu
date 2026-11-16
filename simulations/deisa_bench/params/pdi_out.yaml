@@ -10,6 +10,7 @@ metadata:
   time_saved : double
   deltat: double
   nbstep_diag: int
+  nbstep_pca: int
   MeshX_extents: { type: array, subtype: int64, size: 1 }
   MeshX:
     type: array
