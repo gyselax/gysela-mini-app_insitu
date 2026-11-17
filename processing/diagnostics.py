@@ -1,13 +1,23 @@
 """In-situ diagnostics: conserved-variable calculations and deisa analytics callback."""
 
-import time
+import os
 import csv
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import dask.array as da
 import numpy as np
-from deisa.dask import Deisa
+
+DEISA_VERSION = os.environ.get("DEISA_VERSION", "dask").lower()
+
+if DEISA_VERSION == "ray":
+    from deisa.ray import Deisa
+elif DEISA_VERSION == "dask":
+    from deisa.dask import Deisa
+else:
+    raise ValueError(f"DEISA_VERSION must be 'dask' or 'ray', got {DEISA_VERSION!r}")
+
 from distributed import get_client
 from distributed.diagnostics import MemorySampler
 
@@ -232,7 +242,7 @@ def compute_reduced_diagnostics(reduced, deltat, mx, my, mvx, mvy):
 
 
 @deisa.register("fdistribu", "absolute_time", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy")
-def compute_diagnostics(fdistribu, time, deltat, mx, my, mvx, mvy):
+def compute_diagnostics(fdistribu, absolute_time, deltat, mx, my, mvx, mvy):
     global diagnostics_time
     t0 = time.time()
 
