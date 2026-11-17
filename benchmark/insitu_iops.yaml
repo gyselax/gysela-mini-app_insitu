@@ -26,13 +26,13 @@ vars:
     type: int
     sweep:
       mode: list
-      values: [0, 1]
+      values: [1]
 
   deisa_version:
     type: str
     sweep:
       mode: list
-      values: ["dask", "ray"] #, "ray"]
+      values: ["dask"] #, "ray"]
     when: "diag_mode == 1"
     default: "none"
 
@@ -82,7 +82,7 @@ vars:
   # Overridden per machine: 4 on MI250, 8 on GENOA.
   workers_per_node:
     type: int
-    expr: "1"
+    expr: "8"
       
     #{% if deisa_version == 'dask' %}{{[1, 2, 4, 8, 16, 32][analytics_index] }}{% else %}0{% endif %}
     #{% if deisa_version == 'dask' %}{{[1, 1, 1, 1, 2, 4, 8, 16, 32][simu_index] }}{% else %}0{% endif %}
@@ -106,12 +106,6 @@ vars:
   fdistrib_gib_per_node:
     type: float
     expr: "{{ x_ncells * y_ncells * ( vx_ncells+1 ) * ( vy_ncells+1 ) * 8 / (mpi_ranks // ranks_per_node) / 1024**3 }}"
-
-  # Per-worker memory limit: (node memory - 2 x local distribution function) / workers per node
-  worker_memory_gib:
-    type: int
-    expr: >-
-      {% if workers_per_node > 0 %}{{ ((node_memory_gib - 2 * fdistrib_gib_per_node) / workers_per_node) | int }}{% else %}0{% endif %}
 
   tasks_per_nodes:
     type: int
@@ -432,18 +426,36 @@ machines:
     vars:
       threads_per_node:
         type: int
-        expr: "256"
-      threads_per_rank:
-        type: int
-        expr: "{{ threads_per_node // ranks_per_node }}"
+        expr: "128"
       ranks_per_node:
         type: int
         sweep:
           mode: list
           values: [8]
+      threads_per_rank:
+        type: int
+        expr: "{{ threads_per_node // ranks_per_node }}"
+      workers_per_node:
+        type: int
+        expr: >-
+          {% if deisa_version == 'dask' %}{{ ranks_per_node }}{% else %}0{% endif %}
+      threads_per_worker:
+        type: int
+        expr: "{{ threads_per_rank // 2 - 1 }}"               # 8 cores - 1 sim core = 7
       node_memory_gib:
         type: int
         expr: "256"
+      dask_memory_budget_gib:
+        type: float
+        expr: "{{ node_memory_gib - 2 * fdistrib_gib_per_node }}"
+      dask_worker_memory_gib:
+        type: int
+        expr: >-
+          {% if workers_per_node > 0 %}{{ (dask_memory_budget_gib / workers_per_node) | int }}{% else %}0{% endif %}
+      dask_sched_worker_memory_gib:
+        type: int
+        expr: >-
+          {% if workers_per_node > 2 %}{{ (dask_memory_budget_gib / (workers_per_node - 2)) | int }}{% else %}0{% endif %}
     scripts:
       - name: "gys_compress_IOPS_benchmark"
         inputs:
@@ -476,7 +488,6 @@ machines:
           set -x
  
           export DEISA_VERSION={{ deisa_version }}
-          export PYTHONPATH="${BASE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
           {% if deisa_version == "dask" %}
           # =============================================================================
@@ -489,12 +500,13 @@ machines:
           # ---------------------------------------------------------------------------
           #   * 8 CPUs (0,8,16,24,32,40,48,56) + the 8 GCDs -> gysela-mini-app
           #        1 MPI rank per GCD, each rank pinned to one CPU + one GCD
-          #   * the remaining 56 CPUs -> Dask + analytics. On the scheduler node they are
-          #     split as DASK_CPUS + ANALYTICS_CPUS = 56, with DASK_CPUS=48 and
-          #     ANALYTICS_CPUS=8 by default: the Dask scheduler is pinned to its 48 CPUs,
-          #     analytics to the 8 CPUs reserved for it. Worker nodes run no
-          #     analytics, so their Dask workers take all 56 free CPUs
-          #     (DASK_WORKER_CPUS), leaving no CPU idle. 
+          #   * the remaining 56 CPUs -> Dask + analytics. 
+          #     On the scheduler node they are split as 
+          #       DASK_SCHED_CPUs + DASK_SCHED_WORKER_CPUS + ANALYTICS_CPUs = 56, 
+          #     with DASK_SCHED_CPUS=7, DASK_SCHED_WORKER_CPUS = 42  and
+          #     ANALYTICS_CPUS=7 by default.
+          #     Worker nodes run no analytics, so their Dask workers 
+          #     take all 56 free CPUs (DASK_CPUS), leaving no CPU idle. 
           # 
           # ---------------------------------------------------------------------------
           # Dask scheduler node == worker node
@@ -507,6 +519,7 @@ machines:
           # Everything is written under <execution_dir>/job_<job id>_deisa-ray/:
           #   job.log         script trace (set -x) + general messages
           #   scheduler.log   Dask scheduler stdout + stderr
+          #   dask-sched-worker.log Dask workers on scheduler node  stdout + stderr
           #   dask-worker.log Dask workers stdout + stderr
           #   analytics.log   deisa-dask analytics stdout + stderr
           #   sim.log         gysela-mini-app stdout + stderr (timing metrics)
@@ -527,15 +540,15 @@ machines:
           #   * 8 CPUs (0,8,16,24,32,40,48,56) + the 8 GCDs -> gysela-mini-app
           #        1 MPI rank per GCD, each rank pinned to one CPU + one GCD
           #   * the remaining 56 CPUs -> Ray + analytics. On the head node they are
-          #     split as RAY_CPUS + ANALYTICS_CPUS = 56, with RAY_CPUS=48 and
-          #     ANALYTICS_CPUS=8 by default: the Ray head is pinned to its 48 CPUs,
-          #     analytics to the 8 CPUs reserved for it. Worker nodes run no
+          #     split as RAY_CPUS + ANALYTICS_CPUS = 56, with RAY_CPUS=49 and
+          #     ANALYTICS_CPUS=7 by default: the Ray head is pinned to its 49 CPUs,
+          #     analytics to the 7 CPUs reserved for it. Worker nodes run no
           #     analytics, so their Ray workers take all 56 free CPUs
           #     (RAY_WORKER_CPUS), leaving no CPU idle. Ray is told its budget
           #     through `ray start --num-cpus=...`, so Ray tasks never use more
           #     than the CPUs advertised on the node they run on. Change the split
           #     with, e.g., `RAY_CPUS=40 sbatch launch-...sh`, or
-          #     `RAY_WORKER_CPUS=48` to leave the last 8 CPUs idle on workers too.
+          #     `RAY_WORKER_CPUS=49` to leave the last 7 CPUs idle on workers too.
           #
           # ---------------------------------------------------------------------------
           # Ray head node == worker node
@@ -602,29 +615,21 @@ machines:
           RANKS_PER_NODE={{ ranks_per_node }}          # one MPI rank (and one GCD) per rank
           SIM_ANCHOR_CPUS=(0 8 16 24 32 40 48 56) # 1 gysela CPU per GCD
           {% if deisa_version == "dask" %}
-          DASK_ANALYTICS_CPUS=56                   # CPUs left to Dask on each node
-          DASK_CPUS=${DASK_CPUS:-48}                # CPUs the Dask Scheduler owns (analytics takes the rest)
-          DASK_WORKER_CPUS=${RAY_WORKER_CPUS:-${DASK_ANALYTICS_CPUS}} # worker nodes run no analytics,
-                                                  # so their DASK workers take every free CPU
-          ANALYTICS_CPUS=$((DASK_ANALYTICS_CPUS - DASK_CPUS))
-
-          if ((DASK_CPUS < 0 || DASK_CPUS > DASK_ANALYTICS_CPUS)); then
-            echo "ERROR: DASK_CPUS must be in [0, ${DASK_ANALYTICS_CPUS}] (got ${DASK_CPUS})" >&2
-            exit 1
-          fi
-          if ((DASK_WORKER_CPUS < 0 || DASK_WORKER_CPUS > DASK_ANALYTICS_CPUS)); then
-            echo "ERROR: DASK_WORKER_CPUS must be in [0, ${DASK_ANALYTICS_CPUS}] (got ${DASK_WORKER_CPUS})" >&2
-            exit 1
-          fi
+          DASK_CPUS=56                   # CPUs left to Dask on each node
+          DASK_SCHED_CPUS=7                # CPUs the Dask Scheduler owns (analytics takes the rest)
+          ANALYTICS_CPUS=7
+          DASK_SCHED_WORKER_CPUS=$((DASK_CPUS - DASK_SCHED_CPUS - ANALYTICS_CPUS))
+                              # worker nodes run no analytics, so their DASK workers take every free CPU
 
           # The 56 CPUs not used by the gysela ranks, i.e. every CPU id that is not
-          # one of the anchors (multiples of 8). On the scheduler node they are split into
-          # two disjoint sets: Dask takes the first DASK_CPUS, analytics the remaining
-          # ANALYTICS_CPUS. Worker nodes run no analytics, so their Dask workers take
+          # one of the anchors (multiples of 8). 
+          # On the scheduler node they are split into two disjoint sets: Dask takes the first 
+          # DASK_SCHED_CPUS + DASK_SCHED_WORKER_CPUS, analytics the remaining ANALYTICS_CPUS. 
+          # Worker nodes run no analytics, so their Dask workers take
           # the first DASK_WORKER_CPUS (all 56 by default), leaving no CPU idle.
           {% elif deisa_version == "ray" %}
           RAY_ANALYTICS_CPUS=56                   # CPUs left to Ray + analytics on each node
-          RAY_CPUS=${RAY_CPUS:-48}                # CPUs the Ray head owns (analytics takes the rest)
+          RAY_CPUS=${RAY_CPUS:-49}                # CPUs the Ray head owns (analytics takes the rest)
           RAY_WORKER_CPUS=${RAY_WORKER_CPUS:-${RAY_ANALYTICS_CPUS}} # worker nodes run no analytics,
                                                   # so their Ray workers take every free CPU
           ANALYTICS_CPUS=$((RAY_ANALYTICS_CPUS - RAY_CPUS))
@@ -674,9 +679,10 @@ machines:
           {% endif %}
 
           {% if deisa_version == "dask" %}
+          ANALYTICS_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:0:ANALYTICS_CPUS}")
+          DASK_SCHED_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:ANALYTICS_CPUS:DASK_SCHED_CPUS}")
+          DASK_SCHED_WORKER_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:(ANALYTICS_CPUS+DASK_SCHED_CPUS):DASK_SCHED_WORKER_CPUS}")
           DASK_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:0:DASK_CPUS}")
-          ANALYTICS_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:DASK_CPUS}")
-          DASK_WORKER_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:0:DASK_WORKER_CPUS}")
           {% elif deisa_version == "ray" %}
           RAY_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:0:RAY_CPUS}")
           ANALYTICS_CPU_SET=$(compress_ranges "${ALL_CPUS[@]:RAY_CPUS}")
@@ -694,6 +700,8 @@ machines:
           source "${VENV_ACTIVATE}"
 
           unset LUA_PATH LUA_CPATH
+
+          export PYTHONPATH="${BASE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
           export GYS_DIAG_MODE={{ diag_mode }}
           export OMP_NUM_THREADS=1
@@ -737,8 +745,9 @@ machines:
           echo "Dask scheduler node : ${SCHEDULER_NODE}"
           echo "Dask worker nodes   : ${WORKER_NODELIST:-<none>}"
           echo "CPUs gysela         : ${SIM_ANCHOR_CPUS[*]} (1 per GCD)"
-          echo "CPUs  Dask scheduler (${DASK_CPUS})        : ${DASK_CPU_SET}"
-          echo "CPUs  Dask worker (${DASK_WORKER_CPUS}) : ${DASK_WORKER_CPU_SET}"
+          echo "CPUs  Dask scheduler (${DASK_SCHED_CPUS})        : ${DASK_SCHED_CPU_SET}"
+          echo "CPUs  Dask worker on scheduler node (${DASK_SCHED_WORKER_CPUS}) : ${DASK_SCHED_WORKER_CPU_SET}"
+          echo "CPUs  Dask worker on other nodes (${DASK_CPUS}) : ${DASK_CPU_SET}"
           {% elif deisa_version == "ray" %}
           echo "Ray head node   : ${HEAD_NODE}"
           echo "Ray worker nodes: ${WORKER_NODELIST:-<none>}"
@@ -758,7 +767,7 @@ machines:
 
           srun -N 1 -n 1 -c 128 -w "${SCHEDULER_NODE}"\
             --overlap --cpu-bind=none --export=ALL \
-            numactl --localalloc --physcpubind="${DASK_CPU_SET}" \
+            numactl --localalloc --physcpubind="${DASK_SCHED_CPU_SET}" \
             dask scheduler \
               --scheduler-file={{ schefile }} \
               --interface hsn0 \
@@ -771,6 +780,16 @@ machines:
           done
  
           export DEISA_DASK_SCHEDULER_ADDRESS=$(jq -r '.["address"]' {{ schefile }})
+
+          echo "Launching 6 Dask worker(s) on: ${SCHEDULER_NODE}"
+          srun -N 1 -n 1 -c 128 \
+            -w "${SCHEDULER_NODE}" --overlap --cpu-bind=none --mpi=none --export=ALL \
+            numactl --localalloc --physcpubind="${DASK_SCHED_WORKER_CPU_SET}" \
+            dask worker --nworkers 6 --nthreads 7 \
+              --interface hsn0 --memory-limit {{ dask_sched_worker_memory_gib }}GiB \
+              --local-directory /tmp --scheduler-file={{ schefile }} \
+            >"${LOG_DIR}/dask-sched-worker.log" 2>&1 &
+          SCHEDULER_WORKER_PID=$!
           {% elif deisa_version == "ray" %}
           # -----------------------------------------------------------------------------
           # Ray head on node 0 (also acts as a worker node)
@@ -833,26 +852,29 @@ machines:
 
           {% if deisa_version == "dask" %}
           # -----------------------------------------------------------------------------
-          # Dask workers on all other nodes (the Scheduler node is already a worker)
+          # Dask workers on all other nodes
           # -----------------------------------------------------------------------------
-          echo "Launching ${NNODES} Dask worker(s) on: ${NODES[*]}"
-          srun -N $((NNODES - 1)) -n $((NNODES - 1)) --ntasks-per-node=1 -c 128 \
-            --overlap --cpu-bind=none --mpi=none --export=ALL \
-            numactl --localalloc --physcpubind="${DASK_WORKER_CPU_SET}" \
-            dask worker --nworkers 1 --nthreads "${DASK_WORKER_CPUS}" \
-              --interface hsn0 --memory-limit {{ worker_memory_gib }}GiB \
-              --local-directory /tmp --scheduler-file={{ schefile }} \
-            >"${LOG_DIR}/dask-worker.log" 2>&1 &
-          WORKER_PID=$!
-          echo -n "Waiting for ${NNODES - 1} Dask workers "
+          if ((NNODES > 1)); then
+            echo "Launching ${NNODES} Dask worker(s) on: ${WORKER_NODELIST}"
+            srun -N $((NNODES - 1)) -n $((NNODES - 1)) -c 128 \
+              -w "${WORKER_NODELIST}" --overlap --cpu-bind=none --mpi=none --export=ALL \
+              numactl --localalloc --physcpubind="${DASK_CPU_SET}" \
+              dask worker --nworkers 8 --nthreads 7 \
+                --interface hsn0 --memory-limit {{ dask_worker_memory_gib }}GiB \
+                --local-directory /tmp --scheduler-file={{ schefile }} \
+              >"${LOG_DIR}/dask-worker.log" 2>&1 &
+            WORKER_PID=$!
+          fi
+          NWORKERS_TOTAL=$(( (NNODES - 1) * 8 + 6 ))
+          echo -n "Waiting for ${NWORKERS_TOTAL} Dask workers "
           joined=0
           for _ in $(seq 1 60); do
-            joined=$(cat "${LOG_DIR}"/dask-worker*.log 2>/dev/null | grep -c "Registered to:" || true)
-            ((joined >= NNODES - 1 )) && break
+            joined=$(cat "${LOG_DIR}"/dask-*worker*.log 2>/dev/null | grep -c "Registered to:" || true)
+            ((joined >= $NWORKERS_TOTAL)) && break
             echo -n "."
             sleep 2
           done
-          echo " (${joined}/${NNODES})"
+          echo " (${joined}/${NWORKERS_TOTAL})"
           {% elif deisa_version == "ray" %}
           # -----------------------------------------------------------------------------
           # Ray workers on all other nodes (the head node is already a worker)
@@ -898,8 +920,8 @@ machines:
           cleanup() {
             set +e
             echo "Stopping Dask..."
-            kill ${WORKER_PID:-} ${SCHEDULER_PID:-} 2>/dev/null
-            wait ${WORKER_PID:-} ${SCHEDULER_PID:-} 2>/dev/null
+            kill ${WORKER_PID:-} ${SCHEDULER_WORKER_PID:-} ${SCHEDULER_PID:-} 2>/dev/null
+            wait ${WORKER_PID:-} ${SCHEDULER_WORKER_PID:-} ${SCHEDULER_PID:-} 2>/dev/null
             if [[ -f "${SLURM_BOOT_LOG}" ]]; then
               mv -f "${SLURM_BOOT_LOG}" "${LOG_DIR}/slurm.log" 2>/dev/null
             fi
