@@ -11,6 +11,7 @@
 What the simulation shares and when is set in simulations/deisa_bench/params/pdi_out_diags.yaml.
 """
 
+import os
 import threading
 import time
 import traceback
@@ -20,7 +21,16 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import xarray as xr
 from deisa.core import Window
-from deisa.dask import Deisa
+
+DEISA_VERSION = os.environ.get("DEISA_VERSION", "dask").lower()
+
+if DEISA_VERSION == "ray":
+    from deisa.ray import Deisa
+elif DEISA_VERSION == "dask":
+    from deisa.dask import Deisa
+else:
+    raise ValueError(f"DEISA_VERSION must be 'dask' or 'ray', got {DEISA_VERSION!r}")
+
 from distributed.diagnostics import MemorySampler
 
 from processing.finite_differences import FD_POINTS, FD_TARGET_INDEX, derivative_weights
