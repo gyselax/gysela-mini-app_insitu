@@ -9,8 +9,14 @@
 - Every Output.nbiter_pca iterations: mergeable PCA of fdistribu.
 
 What the simulation shares and when is set in simulations/deisa_bench/params/pdi_out_diags.yaml.
+
+DEISA_VERSION=dask (default) or ray selects the deisa backend; the simulation must use the
+same one. deisa-dask runs each callback in its own thread, deisa-ray runs them one after the
+other, so with deisa-ray the checkpoint callback only starts the writes and
+compute_fluid_moments acknowledges them once they have finished.
 """
 
+import contextlib
 import os
 import threading
 import time
@@ -20,23 +26,29 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 import xarray as xr
-from deisa.core import Window
 
 DEISA_VERSION = os.environ.get("DEISA_VERSION", "dask").lower()
 
 if DEISA_VERSION == "ray":
+    import ray
     from deisa.ray import Deisa
+    from deisa.ray.types import Window
+
+    # deisa-ray has no precompute option
+    REGISTER_OPTIONS = {}
 elif DEISA_VERSION == "dask":
+    from deisa.core import Window
     from deisa.dask import Deisa
+    from distributed.diagnostics import MemorySampler
+
+    REGISTER_OPTIONS = {"precompute": False}
 else:
     raise ValueError(f"DEISA_VERSION must be 'dask' or 'ray', got {DEISA_VERSION!r}")
-
-from distributed.diagnostics import MemorySampler
 
 from processing.finite_differences import FD_POINTS, FD_TARGET_INDEX, derivative_weights
 from processing.hyperblock import HYPERBLOCK_SPECIES, hyperblock_slices
 from processing.moments import fluid_moments
-from processing.per_node_hdf5 import write_per_node
+from processing.per_node_hdf5 import submit_per_node_ray, write_per_node
 
 CHECKPOINT_WRITE_DONE = "checkpoint_write_done"
 
@@ -56,6 +68,41 @@ def _add_time(name, t0):
         timers[name] += time.time() - t0
 
 
+def _write_netcdf(dataset, path):
+    # Under deisa-ray, xarray cannot write dask arrays lazily: compute them first.
+    if DEISA_VERSION == "ray":
+        dataset = dataset.compute()
+    dataset.to_netcdf(path, engine="h5netcdf")
+
+
+# Checkpoint whose writes are running under deisa-ray: (iteration, write task refs, start time)
+pending_checkpoint = None
+
+
+def acknowledge_checkpoint(wait=False):
+    """For deisa-ray, acknowledge the pending checkpoint once all its writes have finished.
+
+    Does not wait for them unless wait is True. A failed write is reported and acknowledged
+    too, so that the simulation keeps launching checkpoints.
+    """
+    global pending_checkpoint
+    if pending_checkpoint is None:
+        return
+    iteration, writes, t0 = pending_checkpoint
+    done, _ = ray.wait(writes, num_returns=len(writes), timeout=None if wait else 0)
+    if len(done) < len(writes):
+        return
+    pending_checkpoint = None
+    try:
+        ray.get(writes)
+    except Exception:
+        print(f"Checkpoint of iter {iteration} failed:", flush=True)
+        traceback.print_exc()
+    if not wait:
+        deisa.set(CHECKPOINT_WRITE_DONE, 1, iteration)
+    _add_time("checkpoint", t0)
+
+
 # ---------------------------------------------------------------------------
 # Deisa analytics callbacks - receive data assembled from all MPI ranks
 # ---------------------------------------------------------------------------
@@ -63,9 +110,10 @@ def _add_time(name, t0):
 deisa = Deisa()
 
 
-@deisa.register("fdistribu", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy", precompute=False)
+@deisa.register("fdistribu", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy", **REGISTER_OPTIONS)
 def compute_fluid_moments(fdistribu, deltat, MeshX, MeshY, MeshVx, MeshVy):
     """Fluid moments of fdistribu at this diagnostic step."""
+    acknowledge_checkpoint()
     t0 = time.time()
     iteration = int(fdistribu[-1].t)
     moments = fluid_moments(fdistribu[-1], MeshVx[-1], MeshVy[-1])
@@ -74,12 +122,12 @@ def compute_fluid_moments(fdistribu, deltat, MeshX, MeshY, MeshVx, MeshVy):
         coords={"species": range(fdistribu[-1].shape[0]), "x": MeshX[-1], "y": MeshY[-1]},
         attrs={"iter": iteration, "time": iteration * float(deltat[-1][0])},
     )
-    dataset.to_netcdf(FLUID_MOMENTS_DIR / f"fluid_moments_iter{iteration:05d}.h5", engine="h5netcdf")
+    _write_netcdf(dataset, FLUID_MOMENTS_DIR / f"fluid_moments_iter{iteration:05d}.h5")
     _add_time("diagnostics", t0)
 
 
 @deisa.register(Window("fdistribu_hyperblock", FD_POINTS), "fdistribu", "deltat",
-                "MeshX", "MeshY", "MeshVx", "MeshVy", precompute=False)
+                "MeshX", "MeshY", "MeshVx", "MeshVy", **REGISTER_OPTIONS)
 def write_hyperblock_derivative(fdistribu_hyperblock, fdistribu, deltat, MeshX, MeshY, MeshVx, MeshVy):
     """Fifth-order time derivative of the hyperblock, wherever its stencil is available.
 
@@ -109,11 +157,12 @@ def write_hyperblock_derivative(fdistribu_hyperblock, fdistribu, deltat, MeshX, 
             "derivative_order": FD_POINTS - 1,
         },
     )
-    dataset.to_netcdf(HYPERBLOCK_DIR / f"dfdistribu_dt_iter{target:05d}.h5", engine="h5netcdf")
+    _write_netcdf(dataset, HYPERBLOCK_DIR / f"dfdistribu_dt_iter{target:05d}.h5")
     _add_time("hyperblock", t0)
 
 
-@deisa.register("fdistribu", "checkpoint_trigger", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy", precompute=False)
+@deisa.register("fdistribu", "checkpoint_trigger", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy",
+                **REGISTER_OPTIONS)
 def write_checkpoint(fdistribu, checkpoint_trigger, deltat, MeshX, MeshY, MeshVx, MeshVy):
     """Write fdistribu with one file per node, then acknowledge the write.
 
@@ -121,6 +170,9 @@ def write_checkpoint(fdistribu, checkpoint_trigger, deltat, MeshX, MeshY, MeshVx
     as soon as the previous checkpoint has been written. The acknowledgement is sent
     even if the write fails, so that the simulation keeps launching checkpoints.
     """
+    if DEISA_VERSION == "ray":
+        start_checkpoint_ray(fdistribu, deltat, MeshX, MeshY, MeshVx, MeshVy)
+        return
     t0 = time.time()
     iteration = int(fdistribu[-1].t)
     try:
@@ -140,7 +192,29 @@ def write_checkpoint(fdistribu, checkpoint_trigger, deltat, MeshX, MeshY, MeshVx
         _add_time("checkpoint", t0)
 
 
-@deisa.register("fdistribu_pca", precompute=False)
+def start_checkpoint_ray(fdistribu, deltat, MeshX, MeshY, MeshVx, MeshVy):
+    """Start the per-node writes of the checkpoint and return without waiting for them."""
+    global pending_checkpoint
+    t0 = time.time()
+    iteration = int(fdistribu[-1].t)
+    try:
+        writes = submit_per_node_ray(
+            fdistribu[-1],
+            {"x": MeshX[-1], "y": MeshY[-1], "vx": MeshVx[-1], "vy": MeshVy[-1]},
+            CHECKPOINT_DIR,
+            prefix=f"fdistribu_iter{iteration:05d}",
+            attrs={"iter": iteration, "time": iteration * float(deltat[-1][0])},
+        )
+    except Exception:
+        print(f"Checkpoint of iter {iteration} failed:", flush=True)
+        traceback.print_exc()
+        deisa.set(CHECKPOINT_WRITE_DONE, 1, iteration)
+        _add_time("checkpoint", t0)
+        return
+    pending_checkpoint = (iteration, writes, t0)
+
+
+@deisa.register("fdistribu_pca", **REGISTER_OPTIONS)
 def compute_mergeable_pca(fdistribu_pca):
     """Mergeable PCA of fdistribu, every Output.nbiter_pca iterations.
 
@@ -155,18 +229,22 @@ def compute_mergeable_pca(fdistribu_pca):
     _add_time("pca", t0)
 
 
-samplers = {
-    "all_callbacks": MemorySampler(),
-    "spilled_memory": MemorySampler(),
-}
+# MemorySampler needs a Dask distributed client, which deisa-ray does not have
+samplers = {}
+if DEISA_VERSION == "dask":
+    samplers = {
+        "all_callbacks": MemorySampler(),
+        "spilled_memory": MemorySampler(),
+    }
 
-with (
-    samplers["all_callbacks"].sample("all_callbacks"),
-    samplers["spilled_memory"].sample("spilled_memory", measure="spilled"),
-):
+with contextlib.ExitStack() as sampling:
+    if samplers:
+        sampling.enter_context(samplers["all_callbacks"].sample("all_callbacks"))
+        sampling.enter_context(samplers["spilled_memory"].sample("spilled_memory", measure="spilled"))
     t0 = time.time()
 
     deisa.execute_callbacks()
+    acknowledge_checkpoint(wait=True)
 
     print("Time analytics:", time.time() - t0, flush=True)
     print("Time diagnostics:", timers["diagnostics"], flush=True)
@@ -179,6 +257,8 @@ plots = {
     "spilled_memory": "spilled_mem_analytics.png",
 }
 for name, filename in plots.items():
+    if name not in samplers:
+        continue
     samplers[name].plot()
     plt.savefig(filename)
     plt.clf()
@@ -188,6 +268,8 @@ csv_files = {
     "spilled_memory": "memory_spilled_samples.csv",
 }
 for name, filename in csv_files.items():
+    if name not in samplers:
+        continue
     df = pd.DataFrame(
         samplers[name].samples[name],
         columns=["time", "memory"],

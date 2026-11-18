@@ -83,6 +83,7 @@ plugins:
           from mpi4py import MPI
           import os
 
+          # DEISA_VERSION=dask (default) or ray, the same as for the analytics
           DEISA_VERSION = os.environ.get("DEISA_VERSION", "dask").lower()
 
           if DEISA_VERSION == "ray":
@@ -103,9 +104,9 @@ plugins:
           def share_with_analytics(fdistribu, timestep, deltat, write_pending, meshes):
             """Send one diagnostic step to deisa and update checkpoint_write_pending."""
             global checkpoint_iter
-            # Bridge.get is collective (all ranks call it) and does not block: it raises
-            # KeyError until a first checkpoint has been acknowledged, then returns None
-            # until the one launched at checkpoint_iter is.
+            # Bridge.get is collective (all ranks call it) and does not block: until the
+            # checkpoint launched at checkpoint_iter is acknowledged, it returns None, or
+            # with deisa-dask raises KeyError if no checkpoint has been acknowledged yet.
             if write_pending:
               try:
                 if bridge.get(CHECKPOINT_WRITE_DONE, timestep=checkpoint_iter):
@@ -166,7 +167,8 @@ plugins:
               arrays_metadata[name] = {"global_shape": (int(size),), "chunk_shape": (int(size),), "chunk_position": (0,)}
 
           # Workaround to not hang during the Bridge initialisation
-          Bridge._prefetch_task_branches = lambda self: None
+          if DEISA_VERSION == "dask":
+            Bridge._prefetch_task_branches = lambda self: None
           bridge = Bridge(comm, arrays_metadata)
           checkpoint_iter = None
           pdi.expose("checkpoint_write_pending", np.array(0, dtype=np.intc), pdi.OUT)
