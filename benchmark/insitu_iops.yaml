@@ -45,7 +45,7 @@ vars:
     type: int
     sweep:
       mode: list
-      values: [1]
+      values: [0,1]
 
   mpi_ranks:
     type: int
@@ -475,7 +475,7 @@ machines:
           #SBATCH --job-name=gys_deisa_bench
           #SBATCH --output={{ execution_dir }}/slurm-%j.log
           #SBATCH --nodes={{ nodes  }}
-          #SBATCH --time=00:15:00
+          #SBATCH --time=00:20:00
           #SBATCH --gpus-per-node=8
           #SBATCH --constraint="MI250"
           #SBATCH --account=gen2224
@@ -979,7 +979,7 @@ machines:
           # wrapper echoes the value into analytics.log so the effective environment
           # of the analytics process is verifiable at runtime.
           echo "Launching analytics: ${ANALYTICS_SCRIPT}"
-          DEISA_DISTRIBUTED_SCHEDULING=1 \
+          DEISA_DISTRIBUTED_SCHEDULING=0 \
             bash -c 'echo "[analytics] DEISA_DISTRIBUTED_SCHEDULING=${DEISA_DISTRIBUTED_SCHEDULING}"; exec numactl --physcpubind="$1" python3 "$2"' \
             _ "${ANALYTICS_CPU_SET}" "${ANALYTICS_SCRIPT}" \
             >"${LOG_DIR}/analytics.log" 2>&1 &
