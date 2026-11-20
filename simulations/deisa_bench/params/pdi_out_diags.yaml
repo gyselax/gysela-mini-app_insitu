@@ -166,9 +166,6 @@ plugins:
                                ("MeshVx", MeshVx_extents[0]), ("MeshVy", MeshVy_extents[0])):
               arrays_metadata[name] = {"global_shape": (int(size),), "chunk_shape": (int(size),), "chunk_position": (0,)}
 
-          # Workaround to not hang during the Bridge initialisation
-          if DEISA_VERSION == "dask":
-            Bridge._prefetch_task_branches = lambda self: None
           bridge = Bridge(comm, arrays_metadata)
           checkpoint_iter = None
           pdi.expose("checkpoint_write_pending", np.array(0, dtype=np.intc), pdi.OUT)
