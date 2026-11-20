@@ -1,0 +1,256 @@
+metadata:
+  fdistribu_filename_size:  size_t
+  fdistribu_filename: { type: array, subtype: char, size: "$fdistribu_filename_size" }
+  Nx_spline_cells : int
+  Ny_spline_cells : int
+  Nvx_spline_cells : int
+  Nvy_spline_cells : int
+  iter : int
+  iter_offset : int
+  time_saved : double
+  deltat: double
+  nbstep_diag: int
+  nbstep_pca: int
+  # 1 while the last fdistribu checkpoint is being written, 0 once it has finished
+  checkpoint_write_pending: int
+  MeshX_extents: { type: array, subtype: int64, size: 1 }
+  MeshX:
+    type: array
+    subtype: double
+    size: [ '$MeshX_extents[0]' ]
+  MeshY_extents: { type: array, subtype: int64, size: 1 }
+  MeshY:
+    type: array
+    subtype: double
+    size: [ '$MeshY_extents[0]' ]
+  MeshVx_extents: { type: array, subtype: int64, size: 1 }
+  MeshVx:
+    type: array
+    subtype: double
+    size: [ '$MeshVx_extents[0]' ]
+  MeshVy_extents: { type: array, subtype: int64, size: 1 }
+  MeshVy:
+    type: array
+    subtype: double
+    size: [ '$MeshVy_extents[0]' ]
+  Nkinspecies: int
+  fdistribu_charges_extents : { type: array, subtype: int64, size: 1 }
+  fdistribu_charges:
+    type: array
+    subtype: double
+    size: [ '$fdistribu_charges_extents[0]' ]
+  fdistribu_masses_extents : { type: array, subtype: int64, size: 1 }
+  fdistribu_masses:
+    type: array
+    subtype: double
+    size: [ '$fdistribu_masses_extents[0]' ]
+  fdistribu_eq_extents : { type: array, subtype: int64, size: 3 }
+  fdistribu_eq:
+    type: array
+    subtype: double
+    size: [ '$fdistribu_eq_extents[0]', '$fdistribu_eq_extents[1]', '$fdistribu_eq_extents[2]' ]
+
+  #-- Parallel data (local chunk)
+  local_fdistribu_starts: { type: array, subtype: size_t, size: 5 }
+  local_fdistribu_extents: { type: array, subtype: size_t, size: 5 }
+
+  #-- Global fdistribu shape (for bridge metadata — distinct from 'fdistribu' data element)
+  global_fdistribu_starts: { type: array, subtype: size_t, size: 5 }
+  global_fdistribu_extents: { type: array, subtype: size_t, size: 5 }
+
+
+data:
+  fdistribu:
+    type: array
+    subtype: double
+    size: [ '$local_fdistribu_extents[0]', '$local_fdistribu_extents[1]', '$local_fdistribu_extents[2]', '$local_fdistribu_extents[3]', '$local_fdistribu_extents[4]' ]
+  electrostatic_potential_extents: { type: array, subtype: int64, size: 2 }
+  electrostatic_potential:
+    type: array
+    subtype: double
+    size: [ '$electrostatic_potential_extents[0]', '$electrostatic_potential_extents[1]' ]
+
+plugins:
+  mpi:
+  pycall:
+    on_event:
+      Init:
+        with: {}
+        exec: |
+          import time
+          import numpy as np
+          import pdi
+          from mpi4py import MPI
+          import os
+
+          # DEISA_VERSION=dask (default) or ray, the same as for the analytics
+          DEISA_VERSION = os.environ.get("DEISA_VERSION", "dask").lower()
+
+          if DEISA_VERSION == "ray":
+            from deisa.ray import Bridge
+          elif DEISA_VERSION == "dask":
+            from deisa.dask import Bridge
+          else:
+              raise ValueError(f"DEISA_VERSION must be 'dask' or 'ray', got {DEISA_VERSION!r}.")
+
+          from processing.hyperblock import hyperblock_piece
+          comm = MPI.COMM_WORLD
+          rank = comm.Get_rank()
+          CHECKPOINT_WRITE_DONE = "checkpoint_write_done"
+
+          if rank == 0:
+            pycall_time = 0.0
+
+          def share_with_analytics(fdistribu, timestep, deltat, write_pending, meshes):
+            """Send one diagnostic step to deisa and update checkpoint_write_pending."""
+            global checkpoint_iter
+            # Bridge.get is collective (all ranks call it) and does not block: until the
+            # checkpoint launched at checkpoint_iter is acknowledged, it returns None, or
+            # with deisa-dask raises KeyError if no checkpoint has been acknowledged yet.
+            if write_pending:
+              try:
+                if bridge.get(CHECKPOINT_WRITE_DONE, timestep=checkpoint_iter):
+                  write_pending = 0
+              except KeyError:
+                pass
+
+            bridge.send("fdistribu", fdistribu, timestep)
+            if hyperblock_layout is not None:
+              bridge.send("fdistribu_hyperblock", np.ascontiguousarray(fdistribu[hyperblock_selection]), timestep)
+            if rank == 0:
+              if not write_pending:
+                bridge.send("checkpoint_trigger", np.array([1], dtype=np.int64), timestep)
+              bridge.send("deltat", np.array([float(deltat)]), timestep)
+              for name, mesh in meshes.items():
+                bridge.send(name, np.array(mesh), timestep)
+
+            if not write_pending:
+              write_pending = 1
+              checkpoint_iter = timestep
+            pdi.expose("checkpoint_write_pending", np.array(write_pending, dtype=np.intc), pdi.OUT)
+      InitBridge:
+        with: { global_fdistribu_extents: $global_fdistribu_extents,
+                local_fdistribu_extents: $local_fdistribu_extents,
+                local_fdistribu_starts: $local_fdistribu_starts,
+                MeshX_extents: $MeshX_extents,
+                MeshY_extents: $MeshY_extents,
+                MeshVx_extents: $MeshVx_extents,
+                MeshVy_extents: $MeshVy_extents
+              }
+        exec: |
+          if rank == 0:
+            t0 = time.time()
+
+          global_shape = tuple(int(n) for n in global_fdistribu_extents)
+          local_shape  = tuple(int(n) for n in local_fdistribu_extents)
+          local_starts = tuple(int(n) for n in local_fdistribu_starts)
+          fdistribu_layout = {
+              "global_shape":   global_shape,
+              "chunk_shape":    local_shape,
+              "chunk_position": tuple(s // n for s, n in zip(local_starts, local_shape)),
+          }
+          arrays_metadata = {
+              "fdistribu":     fdistribu_layout,
+              "fdistribu_pca": fdistribu_layout,
+          }
+
+          # Only the ranks holding a part of the hyperblock send it
+          hyperblock_layout, hyperblock_selection = hyperblock_piece(global_shape, local_shape, local_starts)
+          if hyperblock_layout is not None:
+            arrays_metadata["fdistribu_hyperblock"] = hyperblock_layout
+
+          # Arrays sent by rank 0 only
+          if rank == 0:
+            for name, size in (("deltat", 1), ("checkpoint_trigger", 1),
+                               ("MeshX", MeshX_extents[0]), ("MeshY", MeshY_extents[0]),
+                               ("MeshVx", MeshVx_extents[0]), ("MeshVy", MeshVy_extents[0])):
+              arrays_metadata[name] = {"global_shape": (int(size),), "chunk_shape": (int(size),), "chunk_position": (0,)}
+
+          bridge = Bridge(comm, arrays_metadata)
+          checkpoint_iter = None
+          pdi.expose("checkpoint_write_pending", np.array(0, dtype=np.intc), pdi.OUT)
+
+          if rank == 0:
+            pycall_time += time.time() - t0
+            tbegin = time.time()
+      iteration:
+        with:
+          fdistribu: $fdistribu
+          it: $iter
+          deltat: $deltat
+          iter_offset: $iter_offset
+          nbstep_diag: $nbstep_diag
+          nbstep_pca: $nbstep_pca
+          write_pending: $checkpoint_write_pending
+          MeshX: $MeshX
+          MeshY: $MeshY
+          MeshVx: $MeshVx
+          MeshVy: $MeshVy
+        exec: |
+          if rank == 0:
+            t0 = time.time()
+            print(f"------ iteration {it} - {time.time() - tbegin} ------", flush=True)
+
+          timestep = int(it) + int(iter_offset)
+          if timestep % int(nbstep_diag) == 0:
+            share_with_analytics(fdistribu, timestep, deltat, write_pending,
+                                 {"MeshX": MeshX, "MeshY": MeshY, "MeshVx": MeshVx, "MeshVy": MeshVy})
+          if int(nbstep_pca) > 0 and timestep > 0 and timestep % int(nbstep_pca) == 0:
+            bridge.send("fdistribu_pca", fdistribu, timestep)
+
+          if rank == 0:
+            if timestep % 10 == 0:
+              print(f"--------------------------timestep: {timestep} -----", flush=True)
+            pycall_time += time.time() - t0
+      last_iteration:
+        with:
+          fdistribu: $fdistribu
+          it: $iter
+          deltat: $deltat
+          iter_offset: $iter_offset
+          nbstep_pca: $nbstep_pca
+          write_pending: $checkpoint_write_pending
+          MeshX: $MeshX
+          MeshY: $MeshY
+          MeshVx: $MeshVx
+          MeshVy: $MeshVy
+        exec: |
+          if rank == 0:
+            t0 = time.time()
+
+          timestep = int(it) + int(iter_offset)
+          share_with_analytics(fdistribu, timestep, deltat, write_pending,
+                               {"MeshX": MeshX, "MeshY": MeshY, "MeshVx": MeshVx, "MeshVy": MeshVy})
+          if int(nbstep_pca) > 0 and timestep > 0 and timestep % int(nbstep_pca) == 0:
+            bridge.send("fdistribu_pca", fdistribu, timestep)
+
+          if rank == 0:
+            pycall_time += time.time() - t0
+      EndSimulation:
+        with:
+          it: $iter
+          iter_offset: $iter_offset
+        exec: |
+          if rank == 0:
+            t0 = time.time()
+
+          bridge.close(int(it) + int(iter_offset))
+
+          if rank == 0:
+            pycall_time += time.time() - t0
+            print("Time pycall:", pycall_time, flush=True)
+  decl_hdf5:
+    - file: '${fdistribu_filename}'
+      communicator: $MPI_COMM_WORLD
+      on_event: [read_fdistribu]
+      datasets:
+        fdistribu:
+          type: array
+          subtype: double
+          size: ['$Nkinspecies', '$MeshX_extents[0]', '$MeshY_extents[0]', '$MeshVx_extents[0]', '$MeshVy_extents[0]']
+      read:
+        fdistribu:
+          dataset_selection:
+            size: [ '$local_fdistribu_extents[0]', '$local_fdistribu_extents[1]', '$local_fdistribu_extents[2]', '$local_fdistribu_extents[3]', '$local_fdistribu_extents[4]' ]
+            start: ['$local_fdistribu_starts[0]', '$local_fdistribu_starts[1]', '$local_fdistribu_starts[2]', '$local_fdistribu_starts[3]', '$local_fdistribu_starts[4]']
+  #trace: ~
