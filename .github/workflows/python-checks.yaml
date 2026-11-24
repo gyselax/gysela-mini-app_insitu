@@ -26,4 +26,4 @@ jobs:
           python3 -m pip install -e .[dev]
       - name: Check dependencies using deptry
         run: |
-          deptry --optional-dependencies-dev-groups=dev --package-module-name-map=netcdf4=netCDF4,scikit-learn=sklearn,PyYAML=yaml,scimba=scimba_jax,deisa-dask=deisa .
+          deptry --optional-dependencies-dev-groups=dev --package-module-name-map=scikit-learn=sklearn,PyYAML=yaml,scimba=scimba_jax,deisa-dask=deisa .
