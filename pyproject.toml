@@ -9,9 +9,12 @@ description = "Python utilities for GYSELA mini-apps"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "deisa-dask",
+    "distributed",
     "numpy",
     "h5py",
     "matplotlib",
+    "mpi4py",
     "scikit-learn",
     "PyYAML",
     "xarray[io]",
