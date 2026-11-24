@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "deptry>=0.25.0"]
 cuda12 = ["jax[cuda12]"]
 
 [tool.pytest.ini_options]
