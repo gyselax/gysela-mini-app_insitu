@@ -117,8 +117,8 @@ void init_two_stream(
   double const inv_2pi = 1. / (2. * M_PI);
   double const length_x = PCpp_double(conf_gyselax, ".SplineMesh.x_max") -
                            PCpp_double(conf_gyselax, ".SplineMesh.x_min");
-  double const length_y = PCpp_double(conf_gyselax, ".SplineMesh.y_max") -
-                           PCpp_double(conf_gyselax, ".SplineMesh.y_min");
+  // double const length_y = PCpp_double(conf_gyselax, ".SplineMesh.y_max") -
+  //                          PCpp_double(conf_gyselax, ".SplineMesh.y_min");
 
   ddc::host_for_each(idx_range_kinsp, [&](IdxSp const isp) {
     PC_tree_t const conf_isp = PCpp_get(conf_gyselax, ".SpeciesInfo[%d]", isp.uid());
