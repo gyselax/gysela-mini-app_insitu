@@ -2,8 +2,10 @@ import argparse
 import csv
 import glob
 import os
+from pathlib import Path
 
-import jax
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
@@ -12,6 +14,8 @@ from matplotlib.patches import Rectangle
 from processing.compression.compression_methods.neural_network import (
     AVAILABLE_INR_ARCHS,
     OnlineNeuralNetworkCompressor,
+    _DEFAULT_RECON_CHUNK_SIZE,
+    _vmap_in_chunks,
     assemble_global_field,
     continue_training_offline,
     load_online_params,
@@ -57,6 +61,7 @@ CONSERVED_QUANTITIES = [
     ("momentum", r"$|\Delta P|/P_0$"),
 ]
 
+PHYSICAL_QUANTITIES = ["epot","ekin","etot","mass","momentum","l2norm"]
 
 def load_diags(filename):
     """Read a diagnostics CSV and return a dict of numpy arrays keyed by column name."""
@@ -76,6 +81,106 @@ def load_diags(filename):
     order = np.argsort(rows["iter"])
     return {k: np.array(v)[order] for k, v in rows.items()}
 
+def _read_compression_events_csv(path):
+    iters, data = [], {}
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            iters.append(int(row["iter"]))
+            for k, v in row.items():
+                if k == "iter":
+                    continue
+                try:
+                    data.setdefault(k, []).append(float(v))
+                except (TypeError, ValueError):
+                    pass
+    return iters, data
+
+
+def load_compression_events(data_dir):
+    """Offline writes one compression_events_offline.csv; online writes one
+    compression_events_rank{NNN}.csv per MPI rank (see compression_diagnostics.py) --
+    for online, average each numeric metric across ranks per checkpoint iter.
+
+    `relative_l2_error` is handled specially: each rank's value is a LOCAL ratio
+    ||diff_i||/||f_i||, and ranks can have very different ||f_i|| (e.g. an
+    uneven MPI domain decomposition in velocity space), so a plain mean of
+    ratios is not the true global relative L2 error. When `l2_ref` (||f_i||,
+    written alongside relative_l2_error) is available, combine it as
+    sqrt(sum_i ||diff_i||^2) / sqrt(sum_i ||f_i||^2) instead -- the same
+    quantity offline computes directly on its single assembled field. Falls
+    back to the plain mean for CSVs written before `l2_ref` existed.
+    """
+    path = Path(data_dir) / "compression_events_offline.csv"
+    if path.exists():
+        return _read_compression_events_csv(path)
+
+    rank_paths = sorted(Path(data_dir).glob("compression_events_rank*.csv"))
+    if not rank_paths:
+        return None
+
+    per_rank = [_read_compression_events_csv(p) for p in rank_paths]
+    iters = per_rank[0][0]
+    merged = {}
+    for key in per_rank[0][1]:
+        if key == "relative_l2_error" and all("l2_ref" in d for _, d in per_rank):
+            errs = np.array([d["relative_l2_error"] for _, d in per_rank])  # (n_ranks, n_iters)
+            norms = np.array([d["l2_ref"] for _, d in per_rank])            # (n_ranks, n_iters)
+            merged[key] = list(np.sqrt(np.sum((errs * norms) ** 2, axis=0)) / np.sqrt(np.sum(norms ** 2, axis=0)))
+            continue
+        cols = [d[key] for _, d in per_rank if key in d and len(d[key]) == len(iters)]
+        if cols:
+            merged[key] = list(np.mean(np.array(cols), axis=0))
+    return iters, merged
+
+def _pipeline_prefix(parts):
+    """("offline",), ("online",), or () depending on whether offline_compression/
+    or online_compression/ appears in a resolved path's parts.
+
+    Both pipelines nest their results as NN/<arch>/<optimizer> (or POD/r<n>) under
+    their own offline_compression/ or online_compression/ parent
+    """
+    if "online_compression" in parts:
+        return ("online",)
+    if "offline_compression" in parts:
+        return ("offline",)
+    return ()
+
+def _case_subdir(data_dir, out_dir=None):
+    """Path components identifying a single NN/<arch>/<optimizer> or POD/r<n>
+    case within a results_<case_name> dir, prefixed with "online"/"offline" when
+    that's determinable (see _pipeline_prefix) and out_dir isn't already scoped
+    to that same pipeline
+    """
+    parts = Path(data_dir).resolve().parts
+    prefix = _pipeline_prefix(parts)
+    if prefix and out_dir is not None and prefix[0] in ("online", "offline"):
+        out_parts = Path(out_dir).resolve().parts
+        if f"{prefix[0]}_compression" in out_parts:
+            prefix = ()
+    for marker in ("NN", "POD"):
+        if marker in parts:
+            idx = parts.index(marker)
+            return prefix + parts[idx:]
+    return prefix
+
+def _case_out_dir(data_dir, out_dir):
+    subdir = out_dir.joinpath(*_case_subdir(data_dir, out_dir))
+    subdir.mkdir(parents=True, exist_ok=True)
+    return subdir
+
+def case_label(csv_path):
+    p = Path(csv_path).resolve()
+    parts = p.parent.parts
+    prefix = _pipeline_prefix(parts)
+    for marker in ("NN", "POD"):
+        if marker in parts:
+            idx = parts.index(marker)
+            return "_".join(prefix + parts[idx:])
+    return p.parent.name.replace("branch_","")
+
+def save_fig(fig, out_path):
+    fig.savefig(out_path.with_suffix(".png"), dpi=150, bbox_inches="tight")
+    print(f"Saved {out_path.with_suffix('.png')}")
 
 def plot_diags(diags_filenames, output=None):
     """Plot diagnostic quantities vs time.
@@ -87,11 +192,7 @@ def plot_diags(diags_filenames, output=None):
     if isinstance(diags_filenames, (str, os.PathLike)):
         diags_filenames = [diags_filenames]
 
-    datasets = []
-    for path in diags_filenames:
-        data = load_diags(path)
-        label = os.path.basename(os.path.dirname(os.path.abspath(path))) or os.path.basename(path)
-        datasets.append((label, data))
+    datasets = [(case_label(p), load_diags(p)) for p in diags_filenames]
 
     has_cpu_time = any("cpu_time" in data for _, data in datasets)
     n = len(RAW_QUANTITIES) + len(CONSERVED_QUANTITIES) + (1 if has_cpu_time else 0)
@@ -140,7 +241,214 @@ def plot_diags(diags_filenames, output=None):
         plt.show()
 
     plt.close(fig)
+    
+#specific figures for compression
 
+def plot_physical(cases, quantities, out_dir):
+    conserved_names = {name for name, _ in CONSERVED_QUANTITIES}
+    for q in quantities:
+        is_conserved = q in conserved_names
+        fig, ax = plt.subplots(figsize=(9, 5.5))
+        plotted = False
+        for label, times, data in cases:
+            if q not in data:
+                continue
+            style = dict(linewidth=2.5)
+            if "baseline" in label.lower():
+                style.update(color="black", linestyle="--", linewidth=3.0, zorder=5)
+            if is_conserved:
+                q0 = data[q][0]
+                y = np.abs(data[q] - q0) / np.abs(q0)
+            else:
+                y = np.abs(data[q])
+            ax.semilogy(times, y, label=label, **style)
+            plotted = True
+        if not plotted:
+            print(f"Nothing to plot for {q}.")
+            plt.close(fig)
+            continue
+        ax.set_xlabel("Time")
+        ax.set_ylabel(f"|Δ{q}| / |{q}₀|" if is_conserved else f"|{q}|")
+        ax.set_title(f"{q} over time")
+        ax.legend(fontsize=8)
+        ax.grid(True, which="both", alpha=0.4)
+        fig.tight_layout()
+        save_fig(fig, out_dir / f"{q}_comparison")
+        plt.close(fig)
+        
+def plot_frobenius(compression_cases, out_dir, filt=None, name="frob_error_comparison"):
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    plotted = False
+    for label, data_dir, iters, data in compression_cases:
+        if filt and filt.lower() not in label.lower():
+            continue
+        if not data.get("relative_l2_error"):
+            continue
+        ax.semilogy(iters, data["relative_l2_error"], marker="o", markersize=4, label=label)
+        plotted = True
+    if not plotted:
+        print(f"Nothing to plot for {name}.")
+        plt.close(fig)
+        return
+    ax.set_xlabel("iter")
+    ax.set_ylabel("Relative L2 (Frobenius) error")
+    ax.set_title("Compression error vs iteration")
+    ax.legend(fontsize=8)
+    ax.grid(True, which="both", alpha=0.4)
+    fig.tight_layout()
+    save_fig(fig, out_dir / name)
+    plt.close(fig)
+
+def plot_checkpoint_time(compression_cases, out_dir):
+    """Per-checkpoint compression+decompression time: one figure per case, one
+    stacked bar ("bande") per checkpoint (compression then decompression on
+    top), annotated with that checkpoint's time in seconds and minutes, plus
+    the run's total time annotated on the figure.
+    """
+    for label, data_dir, iters, data in compression_cases:
+        comp_t = np.asarray(data.get("compression_seconds", []), dtype=float)
+        decomp_t = np.asarray(data.get("decompression_seconds", []), dtype=float)
+        if comp_t.size == 0 and decomp_t.size == 0:
+            continue
+        n = len(iters)
+        if comp_t.size != n:
+            comp_t = np.zeros(n)
+        if decomp_t.size != n:
+            decomp_t = np.zeros(n)
+
+        x = np.arange(n)
+        fig, ax = plt.subplots(figsize=(max(10, 0.8 * n + 2), 6))
+        ax.bar(x, comp_t, color="#ff7f0e", label="Compression")
+        ax.bar(x, decomp_t, bottom=comp_t, color="#2ca02c", label="Decompression")
+
+        checkpoint_total = comp_t + decomp_t
+        headroom = checkpoint_total.max() * 0.15 if checkpoint_total.max() > 0 else 1.0
+        for xi, total_i in zip(x, checkpoint_total):
+            ax.text(
+                xi, total_i + headroom * 0.05, f"{total_i:.1f}s\n({total_i / 60:.2f} min)",
+                ha="center", va="bottom", fontsize=9,
+            )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(it) for it in iters], rotation=0)
+        ax.set_xlabel("Checkpoint (iter)")
+        ax.set_ylabel("Time (s)")
+        ax.set_ylim(top=(checkpoint_total.max() + headroom) if checkpoint_total.max() > 0 else 1.0)
+
+        total_all = float(checkpoint_total.sum())
+        ax.set_title(f"{label}: compression + decompression time per checkpoint")
+        ax.text(
+            0.99, 0.98, f"Total: {total_all:.1f} s ({total_all / 60:.2f} min)",
+            transform=ax.transAxes, ha="right", va="top", fontsize=11, fontweight="bold",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
+        ax.legend(loc="upper left")
+        ax.grid(True, axis="y", alpha=0.4)
+        fig.tight_layout()
+        save_fig(fig, _case_out_dir(data_dir, out_dir) / f"checkpoint_time_{label}")
+        plt.close(fig)
+
+def plot_svd_spectrum(data_dirs, compression_cases, out_dir):
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    found = False
+    rank_by_dir = {
+        Path(dd): int(data["param_n_components"][0])
+        for (label, _, _, data), dd in zip(compression_cases, data_dirs)
+        if "param_n_components" in data and data["param_n_components"]
+    }
+    
+    color_cycle = plt.cm.tab10.colors
+    
+    for i, data_dir in enumerate(data_dirs):
+        spectrum_dir = Path(data_dir) / "svd_spectrums"
+        if not spectrum_dir.exists():
+            continue
+        files = sorted(spectrum_dir.glob("spectrum_iter*.csv"))
+        if not files:
+            continue
+        found = True
+        # last checkpoint spectrum
+        arr = np.genfromtxt(files[-1], delimiter=",", skip_header=1)
+        label = case_label(str(data_dir / "diagnostics.csv"))
+        color = color_cycle[i % len(color_cycle)]
+        ax.semilogy(arr[:, 0], arr[:, 1], color=color, marker="o", markersize=3, label=label)
+        if data_dir in rank_by_dir:
+            ax.axvline(rank_by_dir[data_dir], color=color, linestyle="--", alpha=0.7)
+                
+    if not found:
+        print("No svd_spectrum/ found for --svd-spectrum.")
+        plt.close(fig)
+        return
+    
+    ax.set_xlabel("Singular value index i")
+    ax.set_ylabel(r"$\sigma_i/\sigma_1$")
+    ax.set_title("SVD spectrum decay (last checkpoint)")
+    ax.legend(fontsize=7, ncol=2)
+    ax.grid(True, which="both", alpha=0.4)
+    fig.tight_layout()
+    save_fig(fig, out_dir / "svd_spectrum")
+    plt.close(fig)
+    
+def plot_inr_loss(data_dirs, out_dir):
+    found = False
+    for data_dir in data_dirs:
+        loss_dir = Path(data_dir) / "loss_histories"
+        if not loss_dir.exists():
+            continue
+        subdir = _case_out_dir(data_dir, out_dir)
+        optimizer_label = "Gauss-Newton" if "gauss_newton" in str(Path(data_dir)) else "L-BFGS"
+        for fpath in sorted(loss_dir.glob("loss_iter*.npy")):
+            found = True
+            hist = np.load(fpath)
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.semilogy(hist, color="tab:blue", linewidth=2)
+            ax.set_xlabel(f"Optimization step (ADAM then {optimizer_label})")
+            ax.set_ylabel("MSE loss")
+            ax.set_title(fpath.stem)
+            ax.grid(True, which="both", alpha=0.4)
+            fig.tight_layout()
+            save_fig(fig, subdir / fpath.stem)
+            plt.close(fig)
+    if not found:
+        print("No loss_histories/ found for --inr-loss.")
+    
+def resolve_out_dir(args):
+    if args.output_dir:
+        return Path(args.output_dir)
+
+    if len(args.params) <= 1:
+        return Path(args.params[0]).resolve().parent.parent / "comparisons"
+
+    # Place comparisons/ inside the shared offline_compression/ or online_compression/
+    # subtree when every non-baseline path belongs to the same one (matching where
+    # NN/POD results for that pipeline actually live). Falls back to the run root
+    # (two levels above the first path) when paths mix both pipelines -- e.g.
+    # comparing an online run against its offline counterpart -- or contain none.
+    resolved = [Path(p).resolve() for p in args.params]
+    pipeline_roots = set()
+    for p in resolved:
+        for marker in ("offline_compression", "online_compression"):
+            if marker in p.parts:
+                idx = p.parts.index(marker)
+                pipeline_roots.add(Path(*p.parts[:idx + 1]))
+                break
+
+    if len(pipeline_roots) == 1:
+        base = next(iter(pipeline_roots)) / "comparisons"
+    else:
+        base = resolved[0].parent.parent / "comparisons"
+
+    all_paths_str = " ".join(args.params)
+    has_pod = "POD" in all_paths_str
+    has_nn = "NN" in all_paths_str
+    if has_pod and not has_nn:
+        sub = "baseline_vs_POD"
+    elif has_nn and not has_pod:
+        sub = "baseline_vs_INR"
+    else:
+        sub = "mixed_comparisons"
+    
+    return base / sub
 
 def _load_final_snapshot(branch_dir, species=0):
     """Load the final fdistribu snapshot (one species, global domain) and mesh
@@ -169,54 +477,67 @@ def _load_final_snapshot(branch_dir, species=0):
     return fdistribu, bounds, time_saved
 
 
-def plot_final_snapshot_comparison(run_dir, plane="xvx", species=0, index=None, output=None):
-    """Compare the final fdistribu snapshot of the baseline branch against the
-    first compressed branch found, side by side, plus their difference.
+def plot_final_snapshot_comparison(run_dir, plane="xvx", species=0, index=None, reduce="marginal",
+                                    baseline_dir=None):
+    """Compare the final fdistribu snapshot of the baseline branch against every
+    compressed branch found under run_dir, side by side, plus their difference.
 
-    Looks for a "branch_baseline" directory and the first other "branch_*"
-    directory under run_dir that has a final GYSELALIBXX_<iter>.h5 snapshot.
-    Saves to output path if given, otherwise shows interactively.
+    reduce="marginal" (default) sums over the other two axes, matching what
+    the diagnostics (density, epot, ...) integrate over. A raw "slice" at a
+    fixed index can land in a low-density region where the reconstruction's
+    pointwise noise floor dominates the picture even when the field is
+    reconstructed well overall -- pass reduce="slice" to get that old behavior.
+
+    baseline_dir: explicit path to the baseline branch's directory. When not
+    given, a "branch_baseline"-named directory is searched for under run_dir
+    (old behavior). Pass it explicitly when the baseline lives outside run_dir
+    -- e.g. shared directly under the run root while run_dir is scoped to a
+    pipeline-specific subfolder like offline_compression/ or online_compression/,
+    so it would never be found by searching under run_dir alone.
     """
-    branch_dirs = sorted(
-        d for d in glob.glob(os.path.join(run_dir, "branch_*"))
-        if os.path.isdir(d) and glob.glob(os.path.join(d, "GYSELALIBXX_[0-9]*.h5"))
-    )
-    baseline_dir = next((d for d in branch_dirs if os.path.basename(d) == "branch_baseline"), None)
-    other_dirs = [d for d in branch_dirs if d != baseline_dir]
+    branch_dirs = sorted({
+        str(p.parent) for p in Path(run_dir).rglob("GYSELALIBXX_[0-9]*.h5")
+    })
+    if baseline_dir is not None:
+        other_dirs = [d for d in branch_dirs if os.path.basename(d) != "branch_baseline"]
+    else:
+        baseline_dir = next((d for d in branch_dirs if os.path.basename(d) == "branch_baseline"), None)
+        other_dirs = [d for d in branch_dirs if d != baseline_dir]
 
-    if baseline_dir is None or not other_dirs:
+    if baseline_dir is None or not os.path.exists(baseline_dir) or not other_dirs:
         print("\nMissing baseline or compressed final snapshot -- skipping snapshot comparison plot.")
         return
-    compressed_dir = other_dirs[0]
 
     baseline_f, bounds, _ = _load_final_snapshot(baseline_dir, species=species)
-    compressed_f, _, _ = _load_final_snapshot(compressed_dir, species=species)
-
+    baseline_label = case_label(os.path.join(baseline_dir, "diagnostics.csv"))
     extent = _plane_extent(bounds, plane)
-    baseline_2d, axes_labels = _slice_2d(baseline_f, plane=plane, index=index)
-    compressed_2d, _ = _slice_2d(compressed_f, plane=plane, index=index)
-    diff_2d = compressed_2d - baseline_2d
+    baseline_2d, axes_labels = _slice_2d(baseline_f, plane=plane, index=index, reduce=reduce)
+    kind = "marginal" if reduce == "marginal" else "slice"
 
-    fig, axs = plt.subplots(1, 3, figsize=(3 * COMBINED_COL_WIDTH, COMBINED_ROW_HEIGHT))
-    for ax, data, title in (
-        (axs[0], baseline_2d, os.path.basename(baseline_dir)),
-        (axs[1], compressed_2d, os.path.basename(compressed_dir)),
-        (axs[2], diff_2d, "difference"),
-    ):
-        im = ax.imshow(np.asarray(data).T, origin="lower", aspect="auto", extent=extent)
-        ax.set_title(title)
-        ax.set_xlabel(axes_labels[0])
-        ax.set_ylabel(axes_labels[1])
-        fig.colorbar(im, ax=ax, fraction=0.046)
-    fig.tight_layout()
+    for compressed_dir in other_dirs:
+        compressed_f, _, _ = _load_final_snapshot(compressed_dir, species=species)
+        compressed_label = case_label(os.path.join(compressed_dir, "diagnostics.csv"))
+        compressed_2d, _ = _slice_2d(compressed_f, plane=plane, index=index, reduce=reduce)
+        diff_2d = compressed_2d - baseline_2d
 
-    if output:
+        fig, axs = plt.subplots(1, 3, figsize=(3 * COMBINED_COL_WIDTH, COMBINED_ROW_HEIGHT))
+        for ax, data, title in (
+            (axs[0], baseline_2d, baseline_label),
+            (axs[1], compressed_2d, compressed_label),
+            (axs[2], diff_2d, "difference"),
+        ):
+            im = ax.imshow(np.asarray(data).T, origin="lower", aspect="auto", extent=extent)
+            ax.set_title(title)
+            ax.set_xlabel(axes_labels[0])
+            ax.set_ylabel(axes_labels[1])
+            fig.colorbar(im, ax=ax, fraction=0.046)
+        fig.suptitle(f"Final snapshot ({kind} over the other two axes)")
+        fig.tight_layout()
+
+        output = os.path.join(compressed_dir, "final_snapshot_comparison.png")
         fig.savefig(output, bbox_inches="tight")
         print(f"Plot written to: {output}")
-    else:
-        plt.show()
-
-    plt.close(fig)
+        plt.close(fig)
 
 
 # Online (in-situ) neural-network evaluation
@@ -230,29 +551,50 @@ def _find_rank_files(data_dir, it):
     return paths
 
 
-def _slice_2d(array_4d, plane="xvx", index=None):
-    """Reduce a (nx, ny, nvx, nvy) array to a 2D slice for plotting.
+def _slice_2d(array_4d, plane="xvx", index=None, reduce="slice"):
+    """Reduce a (nx, ny, nvx, nvy) array to a 2D field for plotting.
 
-    plane="xvx": fix (y, vy) at `index` (default: central indices), return (nx, nvx).
-    plane="xy": fix (vx, vy) at `index`, return (nx, ny).
-    plane="yvy": fix (x, vx) at `index`, return (ny, nvy).
-    plane="vxvy": fix (x, y) at `index`, return (nvx, nvy).
+    plane="xvx": collapse (y, vy), return (nx, nvx).
+    plane="xy": collapse (vx, vy), return (nx, ny).
+    plane="yvy": collapse (x, vx), return (ny, nvy).
+    plane="vxvy": collapse (x, y), return (nvx, nvy).
+
+    reduce="slice" (default): fix the collapsed axes at `index` (default:
+    central indices) -- cheap but arbitrary, and can land in a low-signal
+    region of phase space where reconstruction noise dominates visually.
+    reduce="marginal": sum over the collapsed axes instead, giving the
+    physically meaningful marginal distribution (comparable to what the
+    diagnostics -- density, epot, ... -- actually integrate over) and
+    averaging out pointwise reconstruction noise.
     """
     nx, ny, nvx, nvy = array_4d.shape
+    planes = {
+        "xvx": ((1, 3), (r"$x$", r"$v_x$")),
+        "xy": ((2, 3), (r"$x$", r"$y$")),
+        "yvy": ((0, 2), (r"$y$", r"$v_y$")),
+        "vxvy": ((0, 1), (r"$v_x$", r"$v_y$")),
+    }
+    if plane not in planes:
+        raise ValueError(f"Unknown plane {plane!r}, expected 'xvx', 'xy', 'yvy', or 'vxvy'")
+    collapse_axes, axes_labels = planes[plane]
+
+    if reduce == "marginal":
+        return array_4d.sum(axis=collapse_axes), axes_labels
+    elif reduce != "slice":
+        raise ValueError(f"Unknown reduce {reduce!r}, expected 'slice' or 'marginal'")
+
     if plane == "xvx":
         iy, ivy = index if index is not None else (ny // 2, nvy // 2)
-        return array_4d[:, iy, :, ivy], (r"$x$", r"$v_x$")
+        return array_4d[:, iy, :, ivy], axes_labels
     elif plane == "xy":
         ivx, ivy = index if index is not None else (nvx // 2, nvy // 2)
-        return array_4d[:, :, ivx, ivy], (r"$x$", r"$y$")
+        return array_4d[:, :, ivx, ivy], axes_labels
     elif plane == "yvy":
         ix, ivx = index if index is not None else (nx // 2, nvx // 2)
-        return array_4d[ix, :, ivx, :], (r"$y$", r"$v_y$")
+        return array_4d[ix, :, ivx, :], axes_labels
     elif plane == "vxvy":
         ix, iy = index if index is not None else (nx // 2, ny // 2)
-        return array_4d[ix, iy, :, :], (r"$v_x$", r"$v_y$")
-    else:
-        raise ValueError(f"Unknown plane {plane!r}, expected 'xvx', 'xy', 'yvy', or 'vxvy'")
+        return array_4d[ix, iy, :, :], axes_labels
 
 
 def evaluate_rank(data_dir, it, rank, species=0):
@@ -611,9 +953,6 @@ def finetune_offline(data_dir, it, ranks=None, out_dir=None, out_iter=None, **kw
     return results
 
 
-# CLI
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate compression benchmark runs.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -690,11 +1029,34 @@ def parse_args():
         "mutually exclusive with --out-dir/--out-iter.",
     )
 
+    compare_parser = subparsers.add_parser(
+        "compare", help="Post-process gysela-mini-app_io compression benchmarks (offline multi-branch comparison)."
+    )
+    compare_parser.add_argument(
+        "--params", type=str, nargs="+", required=True,
+        help="Path(s) to diagnostics.csv (one per branch/run to compare).",
+    )
+    compare_parser.add_argument(
+        "--summary", action="store_true",
+        help="Multi-panel summary figure (raw + relative retained), auto-generated style.",
+    )
+    for q in PHYSICAL_QUANTITIES:
+        compare_parser.add_argument(f"--{q}", action="store_true")
+    compare_parser.add_argument("--frob", action="store_true")
+    compare_parser.add_argument("--frob-pod", action="store_true")
+    compare_parser.add_argument("--frob-inr", action="store_true")
+    compare_parser.add_argument("--svd-spectrum", action="store_true")
+    compare_parser.add_argument("--inr-loss", action="store_true")
+    compare_parser.add_argument("--checkpoint-time", action="store_true")
+    compare_parser.add_argument(
+        "-o", "--output-dir", type=str, default=None,
+        help="Output directory for figures (also used by --summary).",
+    )
+
     args = parser.parse_args()
     if args.command == "finetune-offline" and args.overwrite and (args.out_dir is not None or args.out_iter is not None):
         parser.error("--overwrite is mutually exclusive with --out-dir/--out-iter")
     return args
-
 
 def main():
     args = parse_args()
@@ -716,6 +1078,68 @@ def main():
             iters_adam=args.iters_adam, iters_lbfgs=args.iters_lbfgs,
             warm_start=not args.no_warm_start,
         )
+    elif args.command == "compare":
+        quantities = [q for q in PHYSICAL_QUANTITIES if getattr(args, q.replace("-", "_"))]
+
+        physical_cases, compression_cases, data_dirs, found_params = [], [], [], []
+        missing = []
+        for p in args.params:
+            p = Path(p)
+            if not p.exists():
+                missing.append(p)
+                continue
+
+            found_params.append(str(p))
+            data = load_diags(p)
+            times = data["time"]
+            label = case_label(p)
+            physical_cases.append((label, times, data))
+            data_dir = p.parent
+            data_dirs.append(data_dir)
+            ce = load_compression_events(data_dir)
+            if ce is not None:
+                compression_cases.append((label, data_dir, ce[0], ce[1]))
+
+        if missing:
+            # Loud and impossible to miss: a silently-skipped --params path
+            # means a case (e.g. one optimizer/architecture) quietly vanishes
+            # from every comparison plot and legend below, with the figure
+            # still looking "done" -- this has already happened once (a path
+            # left over from before a directory rename).
+            print(
+                "\n" + "!" * 78 + "\n"
+                f"WARNING: {len(missing)} of {len(args.params)} --params path(s) do NOT exist "
+                "and will be MISSING from every plot below:\n"
+                + "\n".join(f"  - {p}" for p in missing)
+                + "\nCheck for stale/renamed paths.\n" + "!" * 78 + "\n"
+            )
+
+        out_dir = resolve_out_dir(args)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        needs_global = args.summary or quantities or args.frob or args.frob_pod or args.frob_inr or args.svd_spectrum
+        global_dir = out_dir / "global"
+        if needs_global:
+            global_dir.mkdir(parents=True, exist_ok=True)
+
+        if args.summary:
+            plot_diags(found_params, output=global_dir / "diags_comparison.png")
+        if quantities:
+            plot_physical(physical_cases, quantities, global_dir)
+        if args.frob:
+            plot_frobenius(compression_cases, global_dir)
+        if args.frob_pod:
+            plot_frobenius(compression_cases, global_dir, filt="pod", name="frob_error_pod")
+        if args.frob_inr:
+            plot_frobenius(compression_cases, global_dir, filt="nn", name="frob_error_nn")
+        if args.checkpoint_time:
+            plot_checkpoint_time(compression_cases, out_dir)
+        if args.svd_spectrum:
+            plot_svd_spectrum(data_dirs, compression_cases, global_dir)
+        if args.inr_loss:
+            plot_inr_loss(data_dirs, out_dir)
+
+        print(f"\nDone. Figures in {out_dir}")
 
 
 if __name__ == "__main__":
