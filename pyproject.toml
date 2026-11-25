@@ -9,27 +9,24 @@ description = "Python utilities for GYSELA mini-apps"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "deisa-dask",
+    "distributed",
     "numpy",
     "h5py",
     "matplotlib",
+    "mpi4py",
     "scikit-learn",
     "PyYAML",
-    "xarray",
+    "xarray[io]",
     "dask",
-    "h5netcdf",
-    "netcdf4",
     "tqdm",
-    "iops-benchmark",
-    "iops-benchmark[bayesian]",
-    "rich",
-    "flax>=0.12.7",
-    "optax>=0.2.8",
     "jax>=0.4.28",
     "equinox>=0.1.3",
     "scimba==1.3.4",
 ]
 
 [project.optional-dependencies]
+bench = ["iops-benchmark[bayesian]"]
 dev = ["pytest>=8.0", "deptry>=0.25.0"]
 cuda12 = ["jax[cuda12]"]
 
