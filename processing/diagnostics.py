@@ -14,10 +14,18 @@ DEISA_VERSION=dask (default) or ray selects the deisa backend; the simulation mu
 same one. deisa-dask runs each callback in its own thread, deisa-ray runs them one after the
 other, so with deisa-ray the checkpoint callback only starts the writes and a background
 thread acknowledges them once they have finished.
+
+Reports on the analytics, written in the working directory:
+- deisa-dask: dask-report.html, the Dask performance report (task stream, worker profiles,
+  bandwidth) of the whole execute_callbacks();
+- deisa-ray: ray_tasks/<host>-<pid>.csv, the start and end of every Dask task as run by each
+  Ray worker, and ray-timeline.json, the Ray timeline (open it in https://ui.perfetto.dev).
 """
 
 import contextlib
+import csv
 import os
+import socket
 import threading
 import time
 import traceback
@@ -33,12 +41,14 @@ if DEISA_VERSION == "ray":
     import ray
     from deisa.ray import Deisa, MergeablePCA
     from deisa.ray.types import Window
+    from ray.util.dask import RayDaskCallback
 
     # deisa-ray has no precompute option
     REGISTER_OPTIONS = {}
 elif DEISA_VERSION == "dask":
     from deisa.core import Window
     from deisa.dask import Deisa, MergeablePCA
+    from distributed import performance_report
     from distributed.diagnostics import MemorySampler
 
     REGISTER_OPTIONS = {"precompute": False}
@@ -56,6 +66,9 @@ CHECKPOINT_WRITE_DONE = "checkpoint_write_done"
 FLUID_MOMENTS_DIR = Path("fluid_moments").resolve()
 HYPERBLOCK_DIR = Path("hyperblock_dfdt").resolve()
 CHECKPOINT_DIR = Path("checkpoint").resolve()
+RAY_TASKS_DIR = Path("ray_tasks").resolve()
+DASK_REPORT = "dask-report.html"
+RAY_TIMELINE = "ray-timeline.json"
 for directory in (FLUID_MOMENTS_DIR, HYPERBLOCK_DIR, CHECKPOINT_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -92,6 +105,29 @@ def _acknowledge_when_written(iteration, writes, t0):
         traceback.print_exc()
     deisa.set(CHECKPOINT_WRITE_DONE, 1, iteration)
     _add_time("checkpoint", t0)
+
+
+if DEISA_VERSION == "ray":
+
+    class TaskTimerCallback(RayDaskCallback):
+        """Records when each Dask task starts and ends, from inside the Ray worker running it.
+
+        Each worker appends one row per task (key, start, end, duration, in seconds since the
+        epoch) to its own file, <out_dir>/<host>-<pid>.csv.
+        """
+
+        def __init__(self, out_dir):
+            super().__init__()
+            self.out_dir = str(out_dir)
+
+        def _ray_pretask(self, key, object_refs):
+            return time.time()
+
+        def _ray_posttask(self, key, result, pre_state):
+            end = time.time()
+            path = os.path.join(self.out_dir, f"{socket.gethostname()}-{os.getpid()}.csv")
+            with open(path, "a", newline="") as rows:
+                csv.writer(rows).writerow([repr(key), f"{pre_state:.6f}", f"{end:.6f}", f"{end - pre_state:.6f}"])
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +248,7 @@ def mergeable_pca(fdistribu_pca):
     x = fdistribu_pca[-1]
 
     t_start = time.time()
-    pca = MergeablePCA(n_components=3, feature_axes=(3,)).fit(x)
+    pca = MergeablePCA(n_components=3, feature_axes=(1,)).fit(x)
     t_end = time.time()
 
     print(f"[pca] t={x.timestep} start={t_start:.6f} end={t_end:.6f} duration={t_end - t_start:.3f}s "
@@ -232,6 +268,12 @@ with contextlib.ExitStack() as sampling:
     if samplers:
         sampling.enter_context(samplers["all_callbacks"].sample("all_callbacks"))
         sampling.enter_context(samplers["spilled_memory"].sample("spilled_memory", measure="spilled"))
+    if DEISA_VERSION == "dask":
+        sampling.enter_context(deisa.client.as_current())
+        sampling.enter_context(performance_report(filename=DASK_REPORT))
+    else:
+        RAY_TASKS_DIR.mkdir(parents=True, exist_ok=True)
+        sampling.enter_context(TaskTimerCallback(RAY_TASKS_DIR))
     t0 = time.time()
 
     deisa.execute_callbacks()
@@ -243,6 +285,9 @@ with contextlib.ExitStack() as sampling:
     print("Time hyperblock:", timers["hyperblock"], flush=True)
     print("Time checkpoint:", timers["checkpoint"], flush=True)
     print("Time pca:", timers["pca"], flush=True)
+
+if DEISA_VERSION == "ray":
+    ray.timeline(filename=RAY_TIMELINE)
 
 plots = {
     "all_callbacks": "mem_consumption_analytics.png",
