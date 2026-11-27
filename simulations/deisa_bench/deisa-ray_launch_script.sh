@@ -8,7 +8,7 @@
 #SBATCH --exclusive
 #
 # =============================================================================
-# gysela-mini-app (compression) + deisa-ray in-situ analytics
+# gys_deisa_bench + deisa-ray in-situ analytics
 # Adastra / MI250 partition
 # =============================================================================
 #
@@ -18,7 +18,7 @@
 # ---------------------------------------------------------------------------
 # Resource layout, per MI250 node (64 CPU cores, 8 GCDs)
 # ---------------------------------------------------------------------------
-#   * 8 CPUs (0,8,16,24,32,40,48,56) + the 8 GCDs -> gysela-mini-app
+#   * 8 CPUs (0,8,16,24,32,40,48,56) + the 8 GCDs -> gys_deisa_bench
 #        1 MPI rank per GCD, each rank pinned to one CPU + one GCD
 #   * the remaining 56 CPUs -> Ray + analytics. On the head node they are split
 #     as RAY_CPUS + ANALYTICS_CPUS = 56, with RAY_CPUS=48 and ANALYTICS_CPUS=8
@@ -51,13 +51,12 @@
 #   ray-head.log    Ray head   stdout + stderr
 #   ray-worker.log  Ray workers stdout + stderr
 #   analytics.log   deisa-ray analytics stdout + stderr
-#   sim.log         gysela-mini-app stdout + stderr (the timing metrics are here)
+#   sim.log         gys_deisa_bench stdout + stderr (the timing metrics are here)
 #   slurm.log       Slurm-managed bootstrap log (startup + slurmstepd messages)
 #
 # The working directory is set to the job folder, so the run outputs land there
 # too:
-#   diagnostics.csv     deisa-ray analytics output
-#   GYSELALIBXX_*.h5    gysela-mini-app snapshots
+#   fluid_moments/, hyperblock_dfdt/, checkpoint/    deisa-ray analytics outputs
 # =============================================================================
 
 set -e
@@ -67,20 +66,21 @@ set -x
 # -----------------------------------------------------------------------------
 # Paths
 # -----------------------------------------------------------------------------
-# Repo root, resolved from this script's own location (simulations/compression/ -> ../..).
+# Repo root, resolved from this script's own location (simulations/deisa_bench/ -> ../..).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR=${BASE_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}
-TOOLCHAIN_ENV=${TOOLCHAIN_ENV:-/lus/scratch/CT5/gen2224/adevora/gysela-mini-app_insitu/toolchains/adastra/mi250/environment.sh}
+TOOLCHAIN_ENV=${TOOLCHAIN_ENV:-${BASE_DIR}/toolchains/adastra/mi250/environment.sh}
 VENV_ACTIVATE=${VENV_ACTIVATE:-${BASE_DIR}/.gys_env/bin/activate}
 
-GYS_COMPRESS_BIN=${GYS_COMPRESS_BIN:-${BASE_DIR}/build/simulations/compression/gys_compress}
-ANALYTICS_SCRIPT=${ANALYTICS_SCRIPT:-${BASE_DIR}/processing/diagnostics_ray.py}
-PDI_CONFIG=${PDI_CONFIG:-${BASE_DIR}/simulations/compression/params/pdi_out_diags_ray.yaml}
-GYS_CONF=${GYS_CONF:-${BASE_DIR}/simulations/compression/params/params_landau_damping.yaml}
+GYS_DEISA_BENCH_BIN=${GYS_DEISA_BENCH_BIN:-${BASE_DIR}/build/simulations/deisa_bench/gys_deisa_bench}
+ANALYTICS_SCRIPT=${ANALYTICS_SCRIPT:-${BASE_DIR}/processing/diagnostics.py}
+PDI_CONFIG=${PDI_CONFIG:-${BASE_DIR}/simulations/deisa_bench/params/pdi_out_diags.yaml}
+# Every dimension of the grid must split evenly across the 8 ranks per node
+GYS_CONF=${GYS_CONF:-${BASE_DIR}/simulations/deisa_bench/params/params_landau_damping.yaml}
 
 # Base directory for this run (defaults to the submit directory). The job
 # folder below is created inside it and becomes the working directory, so the
-# relative outputs (diagnostics.csv, GYSELALIBXX_*.h5) land in the job folder.
+# relative outputs (fluid_moments/, hyperblock_dfdt/, checkpoint/) land in the job folder.
 EXECUTION_DIR=${EXECUTION_DIR:-${SLURM_SUBMIT_DIR:-${PWD}}}
 GPU_BINDING=${EXECUTION_DIR}/mi250_gpu_binding.sh
 
@@ -169,6 +169,9 @@ source "${VENV_ACTIVATE}"
 
 unset LUA_PATH LUA_CPATH
 
+# The analytics and the simulation's PDI plugin both import the processing package
+export PYTHONPATH="${BASE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+export DEISA_VERSION=ray
 export GYS_DIAG_MODE=1
 export OMP_NUM_THREADS=1
 export MPICH_GPU_SUPPORT_ENABLED=1
@@ -350,7 +353,7 @@ echo "Launching simu on ${SIMU_NODES} nodes (${RANKS_PER_NODE} ranks/node, ${SIM
 srun -N "${SIMU_NODES}" -n "${SIMU_RANKS}" --ntasks-per-node="${RANKS_PER_NODE}" \
   --cpu-bind=none --mem-bind=none --mem=0 --overlap -r 0 \
   "${GPU_BINDING}" \
-  "${GYS_COMPRESS_BIN}" "${GYS_CONF}" "${PDI_CONFIG}" \
+  "${GYS_DEISA_BENCH_BIN}" "${GYS_CONF}" "${PDI_CONFIG}" \
   >"${LOG_DIR}/sim.log" 2>&1 &
 SIM_PID=$!
 

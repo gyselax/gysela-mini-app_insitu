@@ -1,209 +1,133 @@
-"""In-situ diagnostics: conserved-variable calculations and deisa analytics callback."""
+"""In-situ analytics (deisa) for gys_deisa_bench, launched next to the simulation.
 
-import os
+- Every Output.nbiter_diag iterations:
+  - fluid moments of fdistribu (n, ux, uy, T), written to fluid_moments/fluid_moments_iter<iter>.h5;
+  - fifth-order time derivative of the fdistribu hyperblock, wherever its stencil is
+    available, written to hyperblock_dfdt/dfdistribu_dt_iter<iter>.h5.
+- Whenever the previous checkpoint has been written: checkpoint of fdistribu, written to
+  checkpoint/fdistribu_iter<iter>_<host>.h5 with one file per node.
+- Every Output.nbiter_pca iterations: mergeable PCA of fdistribu.
+
+What the simulation shares and when is set in simulations/deisa_bench/params/pdi_out_diags.yaml.
+
+DEISA_VERSION=dask (default) or ray selects the deisa backend; the simulation must use the
+same one. deisa-dask runs each callback in its own thread, deisa-ray runs them one after the
+other, so with deisa-ray the checkpoint callback only starts the writes and a background
+thread acknowledges them once they have finished.
+
+Reports on the analytics, written in the working directory:
+- deisa-dask: dask-report.html, the Dask performance report (task stream, worker profiles,
+  bandwidth) of the whole execute_callbacks();
+- deisa-ray: ray_tasks/<host>-<pid>.csv, the start and end of every Dask task as run by each
+  Ray worker, and ray-timeline.json, the Ray timeline (open it in https://ui.perfetto.dev).
+"""
+
+import contextlib
 import csv
+import os
+import socket
+import threading
 import time
-from dataclasses import dataclass, field
+import traceback
 from pathlib import Path
 
-import dask.array as da
-import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import xarray as xr
 
 DEISA_VERSION = os.environ.get("DEISA_VERSION", "dask").lower()
 
 if DEISA_VERSION == "ray":
-    from deisa.ray import Deisa
+    import ray
+    from deisa.ray import Deisa, MergeablePCA
+    from deisa.ray.types import Window
+    from ray.util.dask import RayDaskCallback
+
+    # deisa-ray has no precompute option
+    REGISTER_OPTIONS = {}
 elif DEISA_VERSION == "dask":
-    from deisa.dask import Deisa
+    from deisa.core import Window
+    from deisa.dask import Deisa, MergeablePCA
+    from distributed import performance_report
+    from distributed.diagnostics import MemorySampler
+
+    REGISTER_OPTIONS = {"precompute": False}
 else:
     raise ValueError(f"DEISA_VERSION must be 'dask' or 'ray', got {DEISA_VERSION!r}")
 
-from distributed import get_client
-from distributed.diagnostics import MemorySampler
+from processing.finite_differences import FD_POINTS, FD_TARGET_INDEX, derivative_weights
+from processing.hyperblock import HYPERBLOCK_SPECIES, hyperblock_slices
+from processing.moments import fluid_moments
+from processing.per_node_hdf5 import submit_per_node_ray, write_per_node
 
-from processing.compression import compression_diagnostics
-from processing import reduced_diagnostics
+CHECKPOINT_WRITE_DONE = "checkpoint_write_done"
 
-import pandas as pd
-import matplotlib.pyplot as plt
+# Absolute paths, as the Dask workers write into these files too
+FLUID_MOMENTS_DIR = Path("fluid_moments").resolve()
+HYPERBLOCK_DIR = Path("hyperblock_dfdt").resolve()
+CHECKPOINT_DIR = Path("checkpoint").resolve()
+RAY_TASKS_DIR = Path("ray_tasks").resolve()
+DASK_REPORT = "dask-report.html"
+RAY_TIMELINE = "ray-timeline.json"
+for directory in (FLUID_MOMENTS_DIR, HYPERBLOCK_DIR, CHECKPOINT_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
 
-_MEASURE_CFG = None
-
-@dataclass
-class PathsConfig:
-    data_dir: Path
-
-
-@dataclass
-class GridConfig:
-    """Uniform 2D2V mesh (x, y, vx, vy) with precomputed wavenumbers."""
-
-    x:  object
-    y:  object
-    vx: object
-    vy: object
-    kx: object = field(init=False)
-    ky: object = field(init=False)
-
-    def __post_init__(self):
-        Nx = da.asarray(self.x).size
-        Ny = da.asarray(self.y).size
-        self.kx = 2.0 * da.pi * da.fft.fftfreq(Nx, d=self.dx)
-        self.ky = 2.0 * da.pi * da.fft.fftfreq(Ny, d=self.dy)
-
-    @staticmethod
-    def spacing(coord):
-        values = da.asarray(coord)
-        if values.size < 2:
-            raise ValueError(
-                "Young Padawan, a single point doth not a grid make. "
-                "The Force requires at least two points."
-            )
-        return float(values[1] - values[0])
-
-    @property
-    def dx(self):
-        return self.spacing(self.x)
-
-    @property
-    def dy(self):
-        return self.spacing(self.y)
-
-    @property
-    def dvx(self):
-        return self.spacing(self.vx)
-
-    @property
-    def dvy(self):
-        return self.spacing(self.vy)
-
-    @property
-    def dV_2D(self):
-        return self.dx * self.dy
-
-    @property
-    def dV_4D(self):
-        return self.dx * self.dy * self.dvx * self.dvy
+timers = {"diagnostics": 0.0, "hyperblock": 0.0, "checkpoint": 0.0, "pca": 0.0}
+_TIMERS_LOCK = threading.Lock()
 
 
-@dataclass
-class Config:
-    paths: PathsConfig
-    grid:  GridConfig
+def _add_time(name, t0):
+    with _TIMERS_LOCK:
+        timers[name] += time.time() - t0
 
 
-def init_measure_config(x, y, vx, vy, data_dir="."):
-    global _MEASURE_CFG
-    _MEASURE_CFG = Config(PathsConfig(Path(data_dir)), GridConfig(x, y, vx, vy))
-    return _MEASURE_CFG
+def _write_netcdf(dataset, path):
+    # Under deisa-ray, xarray cannot write dask arrays lazily: compute them first.
+    if DEISA_VERSION == "ray":
+        dataset = dataset.compute()
+    dataset.to_netcdf(path, engine="h5netcdf")
 
 
-def get_measure_config():
-    if _MEASURE_CFG is None:
-        raise RuntimeError(
-            "Padawan, you have not yet trained your config. "
-            "Call init_measure_config first, you must."
-        )
-    return _MEASURE_CFG
+# Thread acknowledging the last checkpoint started under deisa-ray
+checkpoint_thread = None
 
 
-def density(fdistribu, grid):
-    """Integrate f over all species and velocity dimensions -> n(x, y)."""
-    return da.sum(fdistribu, axis=(0, 3, 4)) * grid.dvx * grid.dvy
+def _acknowledge_when_written(iteration, writes, t0):
+    """Wait for the per-node writes of a deisa-ray checkpoint, then acknowledge it.
 
-
-def poisson_fft(n, grid):
-    """Solve Laplacian(phi) = -(n - 1) on a doubly-periodic domain using da.fft.fft2.
-
-    In Fourier space: -(kx^2 + ky^2) * phi_hat(k) = rho_hat(k)
-    phi_hat(0,0) = 0  (gauge condition)
+    A failed write is reported and acknowledged too, so that the simulation keeps
+    launching checkpoints.
     """
-    rho_hat = da.fft.fft2(n - 1.0)
-
-    KX, KY = da.meshgrid(grid.kx, grid.ky, indexing="ij")
-    k2 = KX ** 2 + KY ** 2
-    k2[0, 0] = 1.0              # avoid /0; DC mode zeroed by mask below
-
-    mask = da.ones_like(k2)
-    mask[0, 0] = 0.0            # gauge: phi_hat(0,0) = 0
-
-    phi_hat = rho_hat / k2 * mask
-    return da.real(da.fft.ifft2(phi_hat))
+    try:
+        ray.get(writes)
+    except Exception:
+        print(f"Checkpoint of iter {iteration} failed:", flush=True)
+        traceback.print_exc()
+    deisa.set(CHECKPOINT_WRITE_DONE, 1, iteration)
+    _add_time("checkpoint", t0)
 
 
-def electric_field_from_potential(phi, grid):
-    """Compute E = -nabla(phi) via spectral differentiation using da.fft.fft2.
+if DEISA_VERSION == "ray":
 
-    In Fourier space:
-      E_hat_x(k) = -1j * kx * phi_hat(k)
-      E_hat_y(k) = -1j * ky * phi_hat(k)
-    Returns array of shape (Nx, Ny, 2).
-    """
-    phi_hat = da.fft.fft2(phi)
-    KX, KY = da.meshgrid(grid.kx, grid.ky, indexing="ij")
-    Ex = da.real(da.fft.ifft2(-1j * KX * phi_hat))
-    Ey = da.real(da.fft.ifft2(-1j * KY * phi_hat))
-    return da.stack([Ex, Ey], axis=-1)
+    class TaskTimerCallback(RayDaskCallback):
+        """Records when each Dask task starts and ends, from inside the Ray worker running it.
 
+        Each worker appends one row per task (key, start, end, duration, in seconds since the
+        epoch) to its own file, <out_dir>/<host>-<pid>.csv.
+        """
 
-def electric_field_energy(Efield, grid):
-    return 0.5 * da.sum(Efield ** 2) * grid.dV_2D
+        def __init__(self, out_dir):
+            super().__init__()
+            self.out_dir = str(out_dir)
 
-_INITIALIZED_DIAG_FILES = set()
+        def _ray_pretask(self, key, object_refs):
+            return time.time()
 
-def measure(cfg, f, Efield, it, t_actual):
-    """Compute and append conserved-variable diagnostics for a 4D f[x, y, vx, vy]."""
-    data_dir = cfg.paths.data_dir
-    data_dir.mkdir(parents=True, exist_ok=True)
-    diag_file_path = data_dir / "diagnostics.csv"
-
-    if f.ndim != 4:
-        raise ValueError(
-            f"Padawan, the electric force is not with you -- "
-            f"f must have 4 dimensions, not {f.ndim}."
-        )
-
-    grid  = cfg.grid
-    vx_bc = grid.vx[(None, None, slice(None), None)]
-    vy_bc = grid.vy[(None, None, None, slice(None))]
-    v2    = vx_bc ** 2 + vy_bc ** 2
-
-    epot       = electric_field_energy(Efield, grid)
-    ekin       = 0.5 * da.sum(f * v2) * grid.dV_4D
-    l2norm_sq  = da.sum(f ** 2) * grid.dV_4D
-    mass       = da.sum(f) * grid.dV_4D
-    momentum_x = da.sum(f * vx_bc) * grid.dV_4D
-    momentum_y = da.sum(f * vy_bc) * grid.dV_4D
-
-    client = get_client()
-    futures = client.compute([
-        epot, ekin, l2norm_sq, mass, momentum_x, momentum_y
-    ])
-    epot, ekin, l2norm_sq, mass, momentum_x, momentum_y = map(
-        float, deisa.client.gather(futures)
-    )
-
-    data = {
-        "iter":       it,
-        "time":       float(t_actual),
-        "ekin":       ekin,
-        "epot":       epot,
-        "etot":       ekin + epot,
-        "l2norm":     float(da.sqrt(l2norm_sq)),
-        "mass":       mass,
-        "momentum":   float(da.hypot(momentum_x, momentum_y)),
-        "momentum_x": momentum_x,
-        "momentum_y": momentum_y,
-    }
-
-    reset = diag_file_path not in _INITIALIZED_DIAG_FILES
-    _INITIALIZED_DIAG_FILES.add(diag_file_path)
-    write_header = reset or not diag_file_path.is_file()
-    with open(diag_file_path, mode="w" if reset else "a", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=data.keys())
-        if write_header:
-            writer.writeheader()
-        writer.writerow(data)
+        def _ray_posttask(self, key, result, pre_state):
+            end = time.time()
+            path = os.path.join(self.out_dir, f"{socket.gethostname()}-{os.getpid()}.csv")
+            with open(path, "a", newline="") as rows:
+                csv.writer(rows).writerow([repr(key), f"{pre_state:.6f}", f"{end:.6f}", f"{end - pre_state:.6f}"])
 
 
 # ---------------------------------------------------------------------------
@@ -212,119 +136,179 @@ def measure(cfg, f, Efield, it, t_actual):
 
 deisa = Deisa()
 
-compression_time = 0.0
-diagnostics_time = 0.0
 
-@deisa.register("fdistribu_offline")
-def compute_offline_compression(fdistribu_chunks):
-    global compression_time
+@deisa.register("fdistribu", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy", **REGISTER_OPTIONS)
+def compute_fluid_moments(fdistribu, deltat, MeshX, MeshY, MeshVx, MeshVy):
+    """Fluid moments of fdistribu at this diagnostic step."""
     t0 = time.time()
-
-    timestep = int(fdistribu_chunks[0].t)
-    
-    print(f"Starting compression of iter {timestep} at time {time.time()}", flush=True)
-    compression_diagnostics.run_offline_compression_on_global_array(fdistribu_chunks[0], timestep)
-    print(f"Finished compression of iter {timestep} at time {time.time()}", flush=True)
-
-    compression_time += time.time() - t0
-
-@deisa.register("fdistribu_reduced", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy")
-def compute_reduced_diagnostics(reduced, deltat, mx, my, mvx, mvy):
-    timestep = int(reduced[0].t)
-    t_actual = timestep * float(deltat[0][0].compute())
-
-    dV_4D = (GridConfig.spacing(mx[0]) * GridConfig.spacing(my[0])
-              * GridConfig.spacing(mvx[0]) * GridConfig.spacing(mvy[0]))
-
-    partials = np.asarray(reduced[0].sum(axis=0))  # (n_ranks, Nsp, 5) -> (Nsp, 5)
-
-    reduced_diagnostics.write_diagnostics_rows(partials, dV_4D, timestep, t_actual, _INITIALIZED_DIAG_FILES)
+    iteration = int(fdistribu[-1].t)
+    moments = fluid_moments(fdistribu[-1], MeshVx[-1], MeshVy[-1])
+    dataset = xr.Dataset(
+        {name: (("species", "x", "y"), field) for name, field in moments.items()},
+        coords={"species": range(fdistribu[-1].shape[0]), "x": MeshX[-1], "y": MeshY[-1]},
+        attrs={"iter": iteration, "time": iteration * float(deltat[-1][0])},
+    )
+    _write_netcdf(dataset, FLUID_MOMENTS_DIR / f"fluid_moments_iter{iteration:05d}.h5")
+    _add_time("diagnostics", t0)
 
 
-@deisa.register("fdistribu", "absolute_time", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy")
-def compute_diagnostics(fdistribu, absolute_time, deltat, mx, my, mvx, mvy):
-    global diagnostics_time
+@deisa.register(Window("fdistribu_hyperblock", FD_POINTS), "fdistribu", "deltat",
+                "MeshX", "MeshY", "MeshVx", "MeshVy", **REGISTER_OPTIONS)
+def write_hyperblock_derivative(fdistribu_hyperblock, fdistribu, deltat, MeshX, MeshY, MeshVx, MeshVy):
+    """Fifth-order time derivative of the hyperblock, wherever its stencil is available.
+
+    The window holds the 4D (x, y, vx, vy) hyperblock of the last FD_POINTS diagnostic
+    steps. Once it is full, the derivative is taken at its step FD_TARGET_INDEX, from the
+    steps 3 before to 2 after it, and written to hyperblock_dfdt/dfdistribu_dt_iter<iter>.h5
+    with the mesh coordinates of the hyperblock. The first 3 and last 2 diagnostic steps
+    of the run have no derivative.
+    """
+    if len(fdistribu_hyperblock) < FD_POINTS:
+        return
     t0 = time.time()
+    iters = [int(block.t) for block in fdistribu_hyperblock]
+    target = iters[FD_TARGET_INDEX]
+    dt = float(deltat[-1][0])
+    weights = derivative_weights([it * dt for it in iters], target * dt)
+    dfdt = sum(w * block for w, block in zip(weights, fdistribu_hyperblock))
+    x, y, vx, vy = hyperblock_slices(fdistribu[-1].shape, fdistribu[-1].chunksize)
+    dataset = xr.Dataset(
+        {"dfdistribu_dt": (("x", "y", "vx", "vy"), dfdt)},
+        coords={"x": MeshX[-1][x], "y": MeshY[-1][y], "vx": MeshVx[-1][vx], "vy": MeshVy[-1][vy]},
+        attrs={
+            "iter": target,
+            "time": target * dt,
+            "species": HYPERBLOCK_SPECIES,
+            "derivative_iters": iters,
+            "derivative_order": FD_POINTS - 1,
+        },
+    )
+    _write_netcdf(dataset, HYPERBLOCK_DIR / f"dfdistribu_dt_iter{target:05d}.h5")
+    _add_time("hyperblock", t0)
 
-    if _MEASURE_CFG is None:
-        init_measure_config(
-            x  = mx[0],
-            y  = my[0],
-            vx = mvx[0],
-            vy = mvy[0],
+
+@deisa.register("fdistribu", "checkpoint_trigger", "deltat", "MeshX", "MeshY", "MeshVx", "MeshVy",
+                **REGISTER_OPTIONS)
+def write_checkpoint(fdistribu, checkpoint_trigger, deltat, MeshX, MeshY, MeshVx, MeshVy):
+    """Write fdistribu with one file per node, then acknowledge the write.
+
+    Fires at the diagnostic steps where the simulation sends checkpoint_trigger, i.e.
+    as soon as the previous checkpoint has been written. The acknowledgement is sent
+    even if the write fails, so that the simulation keeps launching checkpoints.
+    """
+    if DEISA_VERSION == "ray":
+        start_checkpoint_ray(fdistribu, deltat, MeshX, MeshY, MeshVx, MeshVy)
+        return
+    t0 = time.time()
+    iteration = int(fdistribu[-1].t)
+    try:
+        write_per_node(
+            deisa.client,
+            fdistribu[-1],
+            {"x": MeshX[-1], "y": MeshY[-1], "vx": MeshVx[-1], "vy": MeshVy[-1]},
+            CHECKPOINT_DIR,
+            prefix=f"fdistribu_iter{iteration:05d}",
+            attrs={"iter": iteration, "time": iteration * float(deltat[-1][0])},
         )
+    except Exception:
+        print(f"Checkpoint of iter {iteration} failed:", flush=True)
+        traceback.print_exc()
+    finally:
+        deisa.set(CHECKPOINT_WRITE_DONE, 1, iteration)
+        _add_time("checkpoint", t0)
 
-    # This avoids a race condition conflict on persee (sim runs faster then the diagnostics
-    # and republishes t_actual before the one attached to the fdistribu chunk could be used)
-    timestep  = int(fdistribu[0].t)
-    t_actual = timestep * float(deltat[0][0].compute())
 
-    cfg = get_measure_config()
-
-    n      = density(fdistribu[0], cfg.grid)
-    phi    = poisson_fft(n, cfg.grid)
-    Efield = electric_field_from_potential(phi, cfg.grid)
-
-    Nsp = fdistribu[0].shape[0]
-    for isp in range(Nsp):
-        data_dir = cfg.paths.data_dir if Nsp == 1 else cfg.paths.data_dir / f"species_{isp}"
-        sp_cfg = Config(paths=PathsConfig(data_dir), grid=cfg.grid)
-        measure(sp_cfg, fdistribu[0][isp], Efield, timestep, t_actual)
-
-    diagnostics_time += time.time() - t0
-
-samplers = {
-    "all_callbacks": MemorySampler(),
-    "spilled_memory": MemorySampler(),
-}
-
-with (
-    samplers["all_callbacks"].sample("all_callbacks"),
-    samplers["spilled_memory"].sample("spilled_memory", measure="spilled"),
-):
+def start_checkpoint_ray(fdistribu, deltat, MeshX, MeshY, MeshVx, MeshVy):
+    """Start the per-node writes of the checkpoint, and a thread acknowledging them once
+    they have finished, then return without waiting for them."""
+    global checkpoint_thread
     t0 = time.time()
-    
+    iteration = int(fdistribu[-1].t)
+    try:
+        writes = submit_per_node_ray(
+            fdistribu[-1],
+            {"x": MeshX[-1], "y": MeshY[-1], "vx": MeshVx[-1], "vy": MeshVy[-1]},
+            CHECKPOINT_DIR,
+            prefix=f"fdistribu_iter{iteration:05d}",
+            attrs={"iter": iteration, "time": iteration * float(deltat[-1][0])},
+        )
+    except Exception:
+        print(f"Checkpoint of iter {iteration} failed:", flush=True)
+        traceback.print_exc()
+        deisa.set(CHECKPOINT_WRITE_DONE, 1, iteration)
+        _add_time("checkpoint", t0)
+        return
+    checkpoint_thread = threading.Thread(target=_acknowledge_when_written, args=(iteration, writes, t0), daemon=True)
+    checkpoint_thread.start()
+
+
+@deisa.register("fdistribu_pca", **REGISTER_OPTIONS)
+def mergeable_pca(fdistribu_pca):
+    """Mergeable PCA of fdistribu, every Output.nbiter_pca iterations."""
+    x = fdistribu_pca[-1]
+
+    t_start = time.time()
+    pca = MergeablePCA(n_components=3, feature_axes=(1,)).fit(x)
+    t_end = time.time()
+
+    print(f"[pca] t={x.timestep} start={t_start:.6f} end={t_end:.6f} duration={t_end - t_start:.3f}s "
+          f"explained_ratio={pca.explained_variance_ratio_.round(4).tolist()}", flush=True)
+    _add_time("pca", t_start)
+
+
+# MemorySampler needs a Dask distributed client, which deisa-ray does not have
+samplers = {}
+if DEISA_VERSION == "dask":
+    samplers = {
+        "all_callbacks": MemorySampler(),
+        "spilled_memory": MemorySampler(),
+    }
+
+with contextlib.ExitStack() as sampling:
+    if samplers:
+        sampling.enter_context(samplers["all_callbacks"].sample("all_callbacks"))
+        sampling.enter_context(samplers["spilled_memory"].sample("spilled_memory", measure="spilled"))
+    if DEISA_VERSION == "dask":
+        sampling.enter_context(deisa.client.as_current())
+        sampling.enter_context(performance_report(filename=DASK_REPORT))
+    else:
+        RAY_TASKS_DIR.mkdir(parents=True, exist_ok=True)
+        sampling.enter_context(TaskTimerCallback(RAY_TASKS_DIR))
+    t0 = time.time()
+
     deisa.execute_callbacks()
+    if checkpoint_thread is not None:
+        checkpoint_thread.join()
 
     print("Time analytics:", time.time() - t0, flush=True)
-    print("Time compression:", compression_time, flush=True)
-    print("Time diagnostics:", diagnostics_time, flush=True)
-# Save plots
+    print("Time diagnostics:", timers["diagnostics"], flush=True)
+    print("Time hyperblock:", timers["hyperblock"], flush=True)
+    print("Time checkpoint:", timers["checkpoint"], flush=True)
+    print("Time pca:", timers["pca"], flush=True)
+
+if DEISA_VERSION == "ray":
+    ray.timeline(filename=RAY_TIMELINE)
+
 plots = {
     "all_callbacks": "mem_consumption_analytics.png",
     "spilled_memory": "spilled_mem_analytics.png",
 }
 for name, filename in plots.items():
+    if name not in samplers:
+        continue
     samplers[name].plot()
     plt.savefig(filename)
     plt.clf()
 
-# Save raw samples
 csv_files = {
     "all_callbacks": "memory_samples.csv",
     "spilled_memory": "memory_spilled_samples.csv",
 }
 for name, filename in csv_files.items():
+    if name not in samplers:
+        continue
     df = pd.DataFrame(
         samplers[name].samples[name],
         columns=["time", "memory"],
     )
     df.to_csv(filename, index=False)
-
-
-def _sort_diagnostics_files():
-    """Rewrite each diagnostics.csv sorted by iter (rows are appended in
-    task-completion order, which is not guaranteed to be time order)."""
-    for path in _INITIALIZED_DIAG_FILES:
-        with open(path, newline="") as fh:
-            reader = csv.DictReader(fh)
-            fieldnames = reader.fieldnames
-            rows = sorted(reader, key=lambda r: int(r["iter"]))
-        with open(path, "w", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-
-
-_sort_diagnostics_files()
-

@@ -1,14 +1,14 @@
-add_executable(gys_compress
-    ${PROJECT_SOURCE_DIR}/src/compression/gys_compress.cpp
-    ${PROJECT_SOURCE_DIR}/src/compression/predcorr_compress.cpp
+add_executable(gys_deisa_bench
+    ${PROJECT_SOURCE_DIR}/src/deisa_bench/gys_deisa_bench.cpp
+    ${PROJECT_SOURCE_DIR}/src/deisa_bench/predcorr_deisa_bench.cpp
 )
 
-target_include_directories(gys_compress PRIVATE
+target_include_directories(gys_deisa_bench PRIVATE
     ${PROJECT_SOURCE_DIR}/src
-    ${PROJECT_SOURCE_DIR}/src/compression
+    ${PROJECT_SOURCE_DIR}/src/deisa_bench
 )
 
-target_link_libraries(gys_compress
+target_link_libraries(gys_deisa_bench
     PUBLIC
         gysela_mini_app_lib
         DDC::core
@@ -25,4 +25,4 @@ target_link_libraries(gys_compress
         gyselalibxx::utils
 )
 
-install(TARGETS gys_compress)
+install(TARGETS gys_deisa_bench)
